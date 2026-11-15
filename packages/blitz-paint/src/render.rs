@@ -667,6 +667,11 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                 effect_layer_clip.y0 += filter_expansion_area.y0;
                 effect_layer_clip.x1 += filter_expansion_area.x1;
                 effect_layer_clip.y1 += filter_expansion_area.y1;
+                // Local patch (fries fidelity test): an opacity-only layer on a box that doesn't clip its
+                // children must not clip them either (Chrome lets them overflow). Upstream TODO below.
+                if filter.is_none() && backdrop_filter.is_none() && !should_clip {
+                    effect_layer_clip = Rect::new(-1.0e6, -1.0e6, 1.0e6, 1.0e6);
+                }
 
                 // Opacity/Filter layer if box has opacity or a filter.
                 // Clipped to border-box as it needs to include the background and borders.
