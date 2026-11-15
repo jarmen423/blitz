@@ -509,6 +509,13 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         // Don't render things that are out of view
         let overflow = *node.scrollable_overflow();
         let transform = self.node_transform(node, parent_style_transform);
+        let recording = match crate::PAINT_LOG.lock().unwrap().as_mut() {
+            Some(log) => {
+                log.push((node_id, transform.as_coeffs(), size.width as f64, size.height as f64));
+                true
+            }
+            None => false,
+        };
         let screen_transform = Affine::translate(Vec2 {
             x: -self.initial_x,
             y: -self.initial_y,
@@ -518,10 +525,10 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         // Cull elements that fall entirely outside the current clip rectangle. In addition to
         // the viewport, `clip_rect` is narrowed by any ancestor scrollport (see below), so this
         // also culls elements scrolled out of view inside a clipping/scrolling container.
-        if screen_bbox.x1 < clip_rect.x0
-            || screen_bbox.x0 > clip_rect.x1
-            || screen_bbox.y1 < clip_rect.y0
-            || screen_bbox.y0 > clip_rect.y1
+        if !recording && (screen_bbox.x1 < clip_rect.x0)
+            || !recording && screen_bbox.x0 > clip_rect.x1
+            || !recording && screen_bbox.y1 < clip_rect.y0
+            || !recording && screen_bbox.y0 > clip_rect.y1
         {
             return;
         }

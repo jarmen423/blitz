@@ -21,6 +21,11 @@ use anyrender::{PaintScene, Scene};
 use blitz_dom::{BaseDocument, NodeId, util::Color};
 use render::BlitzDomPainter;
 
+/// Local addition (known-future renderer test): while `Some`, every element the painter visits is
+/// logged in paint order as (node id, local-to-screen transform coefficients, border-box width, height),
+/// and off-screen culling is skipped so elements that only move into view later are logged too.
+pub static PAINT_LOG: std::sync::Mutex<Option<Vec<(NodeId, [f64; 6], f64, f64)>>> = std::sync::Mutex::new(None);
+
 const FONT_EMBOLDEN_ENABLED: bool = cfg!(any(
     feature = "font-embolden",
     all(feature = "apple-font-embolden", target_os = "macos"),
