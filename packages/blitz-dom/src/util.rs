@@ -47,6 +47,31 @@ use usvg::fontdb;
 pub(crate) static FONT_DB: LazyLock<Arc<fontdb::Database>> = LazyLock::new(|| {
     let mut db = fontdb::Database::new();
     db.load_system_fonts();
+    // Extra font folders (for example a project's own fonts converted to TTF), colon-separated.
+    if let Ok(dirs) = std::env::var("BLITZ_FONT_DIRS") {
+        for dir in dirs.split(':').filter(|d| !d.is_empty()) {
+            db.load_fonts_dir(dir);
+        }
+    }
+    // fontdb's generic families default to Times New Roman, Arial and Courier New; where those aren't
+    // installed (most Linux machines) SVG text in a generic family was dropped. Use what is installed.
+    let has = |db: &fontdb::Database, name: &str| db.faces().any(|f| f.families.iter().any(|(n, _)| n == name));
+    let pick = |db: &fontdb::Database, names: &[&str]| names.iter().find(|n| has(db, n)).map(|n| n.to_string());
+    if let Some(f) = pick(&db, &["Times New Roman", "Noto Serif", "DejaVu Serif", "Liberation Serif"]) {
+        db.set_serif_family(f);
+    }
+    if let Some(f) = pick(&db, &["Arial", "Noto Sans", "DejaVu Sans", "Liberation Sans"]) {
+        db.set_sans_serif_family(f);
+    }
+    if let Some(f) = pick(&db, &["Courier New", "Noto Mono", "Noto Sans Mono", "DejaVu Sans Mono", "Liberation Mono"]) {
+        db.set_monospace_family(f);
+    }
+    if let Some(f) = pick(&db, &["Comic Sans MS", "Noto Sans", "DejaVu Sans"]) {
+        db.set_cursive_family(f);
+    }
+    if let Some(f) = pick(&db, &["Impact", "Noto Sans", "DejaVu Sans"]) {
+        db.set_fantasy_family(f);
+    }
     Arc::new(db)
 });
 
