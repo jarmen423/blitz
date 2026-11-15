@@ -89,20 +89,33 @@ fn write_png(path: &str, buf: &mut [u8], w: u32, h: u32) {
 fn dump(input: &str, output: &str) {
     let mut document = load(input, VW, VH);
     *blitz_paint::PAINT_LOG.lock().unwrap() = Some(Vec::new());
+    blitz_paint::SVG_LOG.lock().unwrap().clear();
     let _ = render(&mut document, 64, 64, false);
     let log = blitz_paint::PAINT_LOG.lock().unwrap().take().unwrap();
+    let svg_log = std::mem::take(&mut *blitz_paint::SVG_LOG.lock().unwrap());
     let di = LocalName::from("data-i");
     let doc = document.as_ref();
     let mut out = String::from("{\"paint\":[");
     let mut first = true;
-    for (id, m, w, h) in &log {
+    for (id, m, w, h, bb) in &log {
         let Some(node) = doc.get_node(*id) else { continue };
         let Some(i) = node.attr(di.clone()) else { continue };
         if !first {
             out.push(',');
         }
         first = false;
-        write!(out, "[{},[{},{},{},{},{},{}],{},{}]", i, m[0], m[1], m[2], m[3], m[4], m[5], w, h).unwrap();
+        write!(out, "[{},[{},{},{},{},{},{}],{},{},[{},{},{},{}]]", i, m[0], m[1], m[2], m[3], m[4], m[5], w, h, bb[0], bb[1], bb[2], bb[3]).unwrap();
+    }
+    out.push_str("],\"svg\":[");
+    let mut first = true;
+    for (id, bb) in &svg_log {
+        let Some(node) = doc.get_node(*id) else { continue };
+        let Some(i) = node.attr(di.clone()) else { continue };
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        write!(out, "[{},[{},{},{},{}]]", i, bb[0], bb[1], bb[2], bb[3]).unwrap();
     }
     out.push_str("],\"styles\":{");
     let mut first = true;

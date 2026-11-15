@@ -509,18 +509,19 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         // Don't render things that are out of view
         let overflow = *node.scrollable_overflow();
         let transform = self.node_transform(node, parent_style_transform);
-        let recording = match crate::PAINT_LOG.lock().unwrap().as_mut() {
-            Some(log) => {
-                log.push((node_id, transform.as_coeffs(), size.width as f64, size.height as f64));
-                true
-            }
-            None => false,
-        };
         let screen_transform = Affine::translate(Vec2 {
             x: -self.initial_x,
             y: -self.initial_y,
         }) * transform;
         let screen_bbox = screen_transform.transform_rect_bbox(overflow.union(border_box));
+        let recording = match crate::PAINT_LOG.lock().unwrap().as_mut() {
+            Some(log) => {
+                log.push((node_id, transform.as_coeffs(), size.width as f64, size.height as f64,
+                          [screen_bbox.x0, screen_bbox.y0, screen_bbox.x1, screen_bbox.y1]));
+                true
+            }
+            None => false,
+        };
 
         // Cull elements that fall entirely outside the current clip rectangle. In addition to
         // the viewport, `clip_rect` is narrowed by any ancestor scrollport (see below), so this
@@ -1327,6 +1328,12 @@ impl ElementCx<'_, '_> {
 
         let viewport = svg_viewport_affine(svg, paint_size.width, paint_size.height);
         let transform = (self.transform * viewport).then_translate(Vec2 { x, y });
+        if crate::PAINT_LOG.lock().unwrap().is_some() {
+            if let Some(b) = svg.tree.root().abs_layer_bounding_box() {
+                let r = transform.transform_rect_bbox(kurbo::Rect::new(b.left() as f64, b.top() as f64, b.right() as f64, b.bottom() as f64));
+                crate::SVG_LOG.lock().unwrap().push((self.node.id, [r.x0, r.y0, r.x1, r.y1]));
+            }
+        }
 
         // An inline `<svg>`'s `transform` attribute is applied inside the tree, so its
         // viewport clip is left to `overflow`.

@@ -24,7 +24,12 @@ use render::BlitzDomPainter;
 /// Local addition (known-future renderer test): while `Some`, every element the painter visits is
 /// logged in paint order as (node id, local-to-screen transform coefficients, border-box width, height),
 /// and off-screen culling is skipped so elements that only move into view later are logged too.
-pub static PAINT_LOG: std::sync::Mutex<Option<Vec<(NodeId, [f64; 6], f64, f64)>>> = std::sync::Mutex::new(None);
+/// Each entry also carries the element's overflow box (border box plus layout overflow, which includes
+/// text spilling out of a narrow box) in screen coordinates.
+pub static PAINT_LOG: std::sync::Mutex<Option<Vec<(NodeId, [f64; 6], f64, f64, [f64; 4])>>> = std::sync::Mutex::new(None);
+/// While PAINT_LOG is on: for each inline SVG, the screen bounds of what it actually draws (its content can
+/// overflow its box with overflow: visible).
+pub static SVG_LOG: std::sync::Mutex<Vec<(NodeId, [f64; 4])>> = std::sync::Mutex::new(Vec::new());
 
 const FONT_EMBOLDEN_ENABLED: bool = cfg!(any(
     feature = "font-embolden",
