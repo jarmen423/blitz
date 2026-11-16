@@ -3477,8 +3477,10 @@ name = "fshot"
 version = "0.1.0"
 dependencies = [
  "anyrender",
+ "anyrender_skia",
  "anyrender_vello",
  "anyrender_vello_cpu",
+ "anyrender_vello_hybrid",
  "blitz-dom",
  "blitz-html",
  "blitz-net",
@@ -3487,8 +3489,13 @@ dependencies = [
  "image",
  "peniko",
  "png 0.18.1",
+ "pollster",
+ "skia-safe",
  "tokio",
  "url",
+ "vello_gpu",
+ "wgpu 30.0.1",
+ "wgpu_context",
 ]
 
 [[package]]

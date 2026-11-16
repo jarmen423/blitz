@@ -6,15 +6,22 @@ publish = false
 
 [dependencies]
 anyrender = { workspace = true }
-anyrender_vello_cpu = { workspace = true, features = ["multithreading"] }
+anyrender_skia = { workspace = true }
 anyrender_vello = { workspace = true }
+anyrender_vello_cpu = { workspace = true, features = ["multithreading"] }
+anyrender_vello_hybrid = { workspace = true }
 blitz-dom = { workspace = true, features = ["default", "floats"] }
 blitz-html = { workspace = true }
 blitz-traits = { workspace = true }
 blitz-paint = { workspace = true, features = ["svg"] }
 blitz-net = { workspace = true }
 peniko = { workspace = true }
+pollster = { workspace = true }
 png = { workspace = true }
 image = { workspace = true, features = ["png", "jpeg"] }
+skia-safe = "0.157.0"
 url = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
+vello_gpu = "0.4"
+wgpu = { workspace = true }
+wgpu_context = { workspace = true }
