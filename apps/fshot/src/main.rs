@@ -13,7 +13,7 @@
 //! Text and images (docs/FIDELITY.md in known-future):
 //!   FSHOT_GEOMETRIC_PRECISION=1 (default) text as Chrome lays out and draws it under text-rendering:
 //!                               geometricPrecision on Linux (no hinting, Blink's ascent/descent rule); 0 = before
-//!   FSHOT_LCD=rgb (default)     LCD text where it lands on opaque pixels (bgr; 0 = grayscale everywhere)
+//!   FSHOT_LCD=rgb|bgr           LCD text where it lands on opaque pixels (default off: grayscale everywhere)
 //!   FSHOT_TEXT_HINT=0|1         override the hinting; FSHOT_IMAGE_QUALITY=low|medium|high for image-rendering:auto
 //! Pages are loaded from disk; their <base href> (which Blitz doesn't apply itself) becomes the base URL.
 use anyrender::{AntiAliasing, ImageRenderer, PaintScene as _, render_to_buffer};
@@ -668,10 +668,11 @@ fn paintset(base: &str, jobfile: &str) {
 }
 
 fn main() {
-    // fshot draws HyperFrames pages, whose compiler sets `text-rendering: geometricPrecision` on every element and
-    // whose real render draws text LCD (sub-pixel) on opaque layers: those are the defaults here.
-    // FSHOT_GEOMETRIC_PRECISION=0 and FSHOT_LCD=0 give the text of fshot before 2026-11-18.
-    for (k, v) in [("FSHOT_GEOMETRIC_PRECISION", "1"), ("FSHOT_LCD", "rgb")] {
+    // fshot draws HyperFrames pages, whose compiler sets `text-rendering: geometricPrecision` on every element: that
+    // is the default here (FSHOT_GEOMETRIC_PRECISION=0 gives the text of fshot before 2026-11-18). The real render
+    // also draws text LCD on opaque layers; FSHOT_LCD=rgb does that too, but the colour fringes cost about 5 s of
+    // NVENC time on a 16.5-minute episode, so it is off by default (docs/FIDELITY.md in known-future).
+    for (k, v) in [("FSHOT_GEOMETRIC_PRECISION", "1")] {
         if std::env::var_os(k).is_none() {
             #[allow(unused_unsafe)]
             unsafe {
