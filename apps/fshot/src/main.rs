@@ -10,6 +10,11 @@
 //!   FSHOT_BACKEND=skia          (or FSHOT_SKIA=1) anyrender_skia (CPU raster surface, Premul -> straight RGBA)
 //!   FSHOT_BACKEND=vello-hybrid  (or FSHOT_HYBRID=1) anyrender_vello_hybrid (CPU strips + wgpu GPU raster)
 //!   FSHOT_BACKEND=vello-gpu     (or FSHOT_GPU=1) anyrender_vello (full compute GPU Vello)
+//! Text and images (docs/FIDELITY.md in known-future):
+//!   FSHOT_GEOMETRIC_PRECISION=1 (default) text as Chrome lays out and draws it under text-rendering:
+//!                               geometricPrecision on Linux (no hinting, Blink's ascent/descent rule); 0 = before
+//!   FSHOT_LCD=rgb (default)     LCD text where it lands on opaque pixels (bgr; 0 = grayscale everywhere)
+//!   FSHOT_TEXT_HINT=0|1         override the hinting; FSHOT_IMAGE_QUALITY=low|medium|high for image-rendering:auto
 //! Pages are loaded from disk; their <base href> (which Blitz doesn't apply itself) becomes the base URL.
 use anyrender::{AntiAliasing, ImageRenderer, PaintScene as _, render_to_buffer};
 use anyrender_skia::{SkiaSceneCache, SkiaScenePainter};
@@ -663,6 +668,17 @@ fn paintset(base: &str, jobfile: &str) {
 }
 
 fn main() {
+    // fshot draws HyperFrames pages, whose compiler sets `text-rendering: geometricPrecision` on every element and
+    // whose real render draws text LCD (sub-pixel) on opaque layers: those are the defaults here.
+    // FSHOT_GEOMETRIC_PRECISION=0 and FSHOT_LCD=0 give the text of fshot before 2026-11-18.
+    for (k, v) in [("FSHOT_GEOMETRIC_PRECISION", "1"), ("FSHOT_LCD", "rgb")] {
+        if std::env::var_os(k).is_none() {
+            #[allow(unused_unsafe)]
+            unsafe {
+                std::env::set_var(k, v)
+            };
+        }
+    }
     let rt = tokio::runtime::Runtime::new().unwrap();
     let _rt = rt.enter(); // blitz-net fetches assets on the runtime's threads
     let args: Vec<String> = std::env::args().collect();
