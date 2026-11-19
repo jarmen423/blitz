@@ -65,6 +65,64 @@ fn style_without_opacity(style: &str) -> String {
         .join(";")
 }
 
+/// known-future: the computed value of the custom property `name` (with or without its `--`) on
+/// `node`, serialized.
+fn custom_property(node: &Node, name: &str) -> Option<String> {
+    let name = name.trim().trim_start_matches("--");
+    let styles = node.primary_styles()?;
+    let props = styles.custom_properties();
+    let mut i = 0;
+    while let Some((n, value)) = props.property_at(i) {
+        if (&**n as &str).trim_start_matches("--") == name {
+            return value.as_ref().map(|v| v.to_css_string());
+        }
+        i += 1;
+    }
+    None
+}
+
+/// known-future: `var(--name)` and `var(--name, fallback)` in an attribute value replaced with the
+/// element's computed custom property (else the fallback, itself resolved). Chrome resolves them
+/// in an SVG presentation attribute (`<path stroke="var(--fg)">`); usvg does not, and drew no
+/// stroke (an outside project's infinity sign was missing).
+fn resolve_vars(value: &str, node: &Node, depth: u8) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(start) = rest.find("var(") {
+        out.push_str(&rest[..start]);
+        let inner_start = start + 4;
+        // the matching closing parenthesis, and the first top-level comma before it
+        let (mut level, mut comma, mut end) = (0i32, None, None);
+        for (k, c) in rest[inner_start..].char_indices() {
+            match c {
+                '(' => level += 1,
+                ')' if level == 0 => {
+                    end = Some(inner_start + k);
+                    break;
+                }
+                ')' => level -= 1,
+                ',' if level == 0 && comma.is_none() => comma = Some(inner_start + k),
+                _ => {}
+            }
+        }
+        let Some(end) = end else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let name = &rest[inner_start..comma.unwrap_or(end)];
+        let resolved = custom_property(node, name).or_else(|| {
+            comma.map(|c| match depth {
+                0..8 => resolve_vars(rest[c + 1..end].trim(), node, depth + 1),
+                _ => String::new(),
+            })
+        });
+        out.push_str(resolved.as_deref().unwrap_or("").trim());
+        rest = &rest[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Writes an attribute's serialized name, per the HTML fragment serialization algorithm
 fn write_attr_name(name: &QualName, writer: &mut String) {
     match name.ns {
@@ -241,14 +299,19 @@ impl Node {
                     writer.push(' ');
                     write_attr_name(&attr.name, writer);
                     writer.push_str("=\"");
+                    let resolved;
+                    let attr_value: &str = if opts.resolve_current_color && attr.value.contains("var(") {
+                        resolved = resolve_vars(&attr.value, self, 0);
+                        &resolved
+                    } else {
+                        &attr.value
+                    };
                     #[allow(clippy::unnecessary_unwrap)] // Convert to if-let chain once stabilised
-                    if current_color.is_some() && attr.value.contains("currentColor") {
-                        let value = attr
-                            .value
-                            .replace("currentColor", current_color.as_ref().unwrap());
+                    if current_color.is_some() && attr_value.contains("currentColor") {
+                        let value = attr_value.replace("currentColor", current_color.as_ref().unwrap());
                         encode_quoted_attribute_to_string(&value, writer);
                     } else {
-                        encode_quoted_attribute_to_string(&attr.value, writer);
+                        encode_quoted_attribute_to_string(attr_value, writer);
                     }
                     writer.push('"');
                 }
