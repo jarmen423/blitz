@@ -148,6 +148,16 @@ fn sample_points_along_path(path: &BezPath, spacing: f64, count: usize) -> Vec<P
 impl ElementCx<'_, '_> {
     /// Draw all borders for a node
     pub(crate) fn draw_border(&self, scene: &mut impl PaintScene) {
+        // known-future: in a table whose borders collapse (and are resolved), the table draws every
+        // border (`draw_collapsed_table_borders`); neither it nor its cells draw their own
+        if self.node.collapsed_cell_border.get().is_some() {
+            return;
+        }
+        if let SpecialElementData::TableRoot(table) = &self.element.special_data
+            && table.collapsed.is_some()
+        {
+            return;
+        }
         let style = &*self.style;
         let border = style.get_border();
         let current_color = style.clone_color();
@@ -553,6 +563,11 @@ impl ElementCx<'_, '_> {
         if table.border_collapse != BorderCollapse::Collapse {
             return;
         }
+        // known-future: resolved collapsed borders are drawn after the cells
+        // (`draw_collapsed_table_borders`)
+        if table.collapsed.is_some() {
+            return;
+        }
 
         let Some(grid_info) = &mut *table.computed_grid_info.borrow_mut() else {
             return;
@@ -627,6 +642,70 @@ impl ElementCx<'_, '_> {
             }
             for (prev, next) in cols.iter().zip(cols.iter().skip(1)) {
                 fill(prev.end as f64, y0, next.start as f64, y1);
+            }
+        }
+    }
+
+    /// known-future: a table's resolved collapsed borders (blitz-dom `CollapsedBorders`), each
+    /// segment centred on its grid line, drawn over the cells' backgrounds as Blink draws them.
+    /// Rows meet at their tracks' edges (there is no gap in this model); a horizontal segment at
+    /// the table's left or right end reaches over half of the outer vertical border so the corner
+    /// is filled. Every style is drawn solid.
+    pub(crate) fn draw_collapsed_table_borders(&self, scene: &mut impl PaintScene) {
+        let SpecialElementData::TableRoot(table) = &self.element.special_data else {
+            return;
+        };
+        let Some(borders) = &table.collapsed else {
+            return;
+        };
+        let grid_info = table.computed_grid_info.borrow();
+        let Some(grid_info) = &*grid_info else {
+            return;
+        };
+        let cols: Vec<_> = PhysicalTracks::from_tracks(&grid_info.columns).iter().collect();
+        let rows: Vec<_> = PhysicalTracks::from_tracks(&grid_info.rows).iter().collect();
+        let (nrows, ncols) = (borders.rows.min(rows.len()), borders.cols.min(cols.len()));
+        if nrows == 0 || ncols == 0 {
+            return;
+        }
+        let row_line = |i: usize| if i < nrows { rows[i].start } else { rows[nrows - 1].end } as f64;
+        let col_line = |j: usize| if j < ncols { cols[j].start } else { cols[ncols - 1].end } as f64;
+        let mut fill = |edge: blitz_dom::CollapsedEdge, x0: f64, y0: f64, x1: f64, y1: f64| {
+            let color = edge.color.as_srgb_color();
+            if color.components[3] == 0.0 {
+                return;
+            }
+            let shape = Rect::new(x0, y0, x1, y1).scale_from_origin(self.scale);
+            scene.fill(Fill::NonZero, self.transform, color, None, &shape, AntiAliasing::Enabled);
+        };
+        let outer_v = |i: usize, j: usize| -> f64 {
+            let above = i.checked_sub(1).and_then(|r| borders.v(r, j)).map_or(0.0, |e| e.width);
+            let below = (i < nrows).then(|| borders.v(i, j)).flatten().map_or(0.0, |e| e.width);
+            above.max(below) as f64
+        };
+        for i in 0..=nrows {
+            let y = row_line(i);
+            for c in 0..ncols {
+                let Some(edge) = borders.h(i, c) else { continue };
+                let half = edge.width as f64 / 2.0;
+                let mut x0 = cols[c].start as f64;
+                let mut x1 = cols[c].end as f64;
+                if c == 0 {
+                    x0 -= outer_v(i, 0) / 2.0;
+                }
+                if c + 1 == ncols {
+                    x1 += outer_v(i, borders.cols) / 2.0;
+                }
+                fill(edge, x0, y - half, x1, y + half);
+            }
+        }
+        for r in 0..nrows {
+            let (y0, y1) = (rows[r].start as f64, rows[r].end as f64);
+            for j in 0..=ncols {
+                let Some(edge) = borders.v(r, if j == ncols { borders.cols } else { j }) else { continue };
+                let x = col_line(j);
+                let half = edge.width as f64 / 2.0;
+                fill(edge, x - half, y0, x + half, y1);
             }
         }
     }

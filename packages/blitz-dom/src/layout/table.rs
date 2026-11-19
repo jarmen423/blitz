@@ -16,6 +16,7 @@ use style::values::computed::length_percentage::{
 use style::values::computed::{Length, LengthPercentage};
 use style::values::generics::Optional;
 use style::values::specified::box_::{DisplayInside, DisplayOutside};
+use style::color::AbsoluteColor;
 use style::{
     Atom, computed_values::border_collapse::T as BorderCollapse,
     computed_values::table_layout::T as TableLayout, values::computed::BorderStyle,
@@ -49,6 +50,11 @@ pub struct TableContext {
     pub computed_grid_info: AtomicRefCell<Option<DetailedGridInfo<Atom>>>,
     pub border_style: Option<ServoArc<Border>>,
     pub border_collapse: BorderCollapse,
+    /// known-future: the resolved collapsed borders (`border-collapse: collapse` in a horizontal,
+    /// left-to-right table), painted by the table after its cells. `None` in the separated model,
+    /// and in the collapsed model of other writing modes, which keeps the uniform gutters of
+    /// `border_style`.
+    pub collapsed: Option<CollapsedBorders>,
     /// Backing storage for `calc()` track sizes synthesised by the table layout code.
     /// Taffy stores calc values as raw pointers, so these must outlive the `style`.
     #[allow(dead_code)]
@@ -69,7 +75,253 @@ pub struct TableCell {
     pub row: u16,
     /// Index of the column the cell originates in
     pub column: u16,
+    /// known-future: the rows and columns the cell spans
+    pub rowspan: u16,
+    pub colspan: u16,
+    /// known-future: the cell's content-box length `width` sized its column (first row)
+    width_sets_column: bool,
     style: taffy::Style<Atom>,
+}
+
+/// known-future: one segment of a table's collapsed borders, the winner of CSS 2.1 §17.6.2.1's
+/// conflict resolution between the cells, rows, row groups and table that meet there.
+#[derive(Debug, Clone, Copy)]
+pub struct CollapsedEdge {
+    pub width: f32,
+    pub style: BorderStyle,
+    pub color: AbsoluteColor,
+}
+
+/// known-future: a table's collapsed borders, one segment per cell edge of the grid. Each is
+/// centred on its grid line: a cell's border box holds half of each of its edges (the widest
+/// segment along it) and the table's border box half of the outer ones, as in Blink, so a rule of
+/// 3px between two rows moves the rows below it down by 3px.
+#[derive(Debug, Clone)]
+pub struct CollapsedBorders {
+    pub rows: usize,
+    pub cols: usize,
+    /// `(rows + 1) * cols` segments: horizontal line `i` (0 is the table's top) at column `c` is
+    /// `i * cols + c`
+    pub horizontal: Vec<Option<CollapsedEdge>>,
+    /// `rows * (cols + 1)` segments: row `r` at vertical line `j` (0 is the table's left) is
+    /// `r * (cols + 1) + j`
+    pub vertical: Vec<Option<CollapsedEdge>>,
+}
+
+impl CollapsedBorders {
+    pub fn h(&self, line: usize, col: usize) -> Option<CollapsedEdge> {
+        self.horizontal.get(line * self.cols + col).copied().flatten()
+    }
+    pub fn v(&self, row: usize, line: usize) -> Option<CollapsedEdge> {
+        self.vertical.get(row * (self.cols + 1) + line).copied().flatten()
+    }
+    fn hw(&self, line: usize, col: usize) -> f32 {
+        self.h(line, col).map_or(0.0, |e| e.width)
+    }
+    fn vw(&self, row: usize, line: usize) -> f32 {
+        self.v(row, line).map_or(0.0, |e| e.width)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Side {
+    Top,
+    Right,
+    Bottom,
+    Left,
+}
+
+/// A border that takes part in the conflict resolution: `origin` ranks the element it comes from
+/// (cell 5, row 4, row group 3, table 0); candidates are listed top or left first.
+#[derive(Clone, Copy)]
+struct BorderCandidate {
+    width: f32,
+    style: BorderStyle,
+    color: AbsoluteColor,
+    origin: u8,
+}
+
+fn border_candidate(doc: &BaseDocument, node_id: NodeId, side: Side, origin: u8) -> Option<BorderCandidate> {
+    let style = doc.nodes.get(node_id)?.primary_styles()?;
+    let border = style.get_border();
+    let (width, border_style, color) = match side {
+        Side::Top => (border.border_top_width.0, border.border_top_style, &border.border_top_color),
+        Side::Right => (border.border_right_width.0, border.border_right_style, &border.border_right_color),
+        Side::Bottom => (border.border_bottom_width.0, border.border_bottom_style, &border.border_bottom_color),
+        Side::Left => (border.border_left_width.0, border.border_left_style, &border.border_left_color),
+    };
+    Some(BorderCandidate {
+        width: side_width(width, border_style),
+        style: border_style,
+        color: color.resolve_to_absolute(&style.clone_color()),
+        origin,
+    })
+}
+
+fn border_style_rank(style: BorderStyle) -> u8 {
+    match style {
+        BorderStyle::Double => 8,
+        BorderStyle::Solid => 7,
+        BorderStyle::Dashed => 6,
+        BorderStyle::Dotted => 5,
+        BorderStyle::Ridge => 4,
+        BorderStyle::Outset => 3,
+        BorderStyle::Groove => 2,
+        BorderStyle::Inset => 1,
+        BorderStyle::None | BorderStyle::Hidden => 0,
+    }
+}
+
+/// CSS 2.1 §17.6.2.1: `hidden` wins outright (no border); otherwise the widest, then the style
+/// (double, solid, dashed, dotted, ridge, outset, groove, inset), then cell over row over row
+/// group over table, then the one further up or left.
+fn resolve_border(candidates: &[BorderCandidate]) -> Option<CollapsedEdge> {
+    if candidates.iter().any(|c| c.style == BorderStyle::Hidden) {
+        return None;
+    }
+    let mut best: Option<&BorderCandidate> = None;
+    for c in candidates.iter().filter(|c| c.width > 0.0 && c.style != BorderStyle::None) {
+        let better = best.is_none_or(|b| {
+            c.width > b.width
+                || (c.width == b.width
+                    && (border_style_rank(c.style), c.origin) > (border_style_rank(b.style), b.origin))
+        });
+        if better {
+            best = Some(c);
+        }
+    }
+    best.map(|b| CollapsedEdge {
+        width: b.width,
+        style: b.style,
+        color: b.color,
+    })
+}
+
+/// known-future: resolve every segment of a collapsed table's borders, then lay the borders out
+/// as Blink does: each cell's border is half of each of its edges (`Node::collapsed_cell_border`,
+/// which its own layout reads too) and the table's border is half of its outer edges; there is no
+/// gap.
+fn resolve_collapsed_borders(
+    doc: &BaseDocument,
+    table_id: NodeId,
+    cells: &mut [TableCell],
+    rows: &[TableRow],
+    cols: usize,
+) -> (CollapsedBorders, taffy::Rect<f32>, Vec<f32>) {
+    let nrows = rows.len();
+    let mut owner: Vec<Option<usize>> = vec![None; nrows * cols];
+    for (k, cell) in cells.iter().enumerate() {
+        let (r0, c0) = (cell.row as usize, cell.column as usize);
+        for r in r0..(r0 + cell.rowspan as usize).min(nrows) {
+            for c in c0..(c0 + cell.colspan as usize).min(cols) {
+                owner[r * cols + c].get_or_insert(k);
+            }
+        }
+    }
+    let at = |r: usize, c: usize| owner[r * cols + c];
+    let mut cand: Vec<BorderCandidate> = Vec::with_capacity(8);
+    let push = |cand: &mut Vec<BorderCandidate>, id: Option<NodeId>, side: Side, origin: u8| {
+        if let Some(c) = id.and_then(|id| border_candidate(doc, id, side, origin)) {
+            cand.push(c);
+        }
+    };
+
+    let mut horizontal = Vec::with_capacity((nrows + 1) * cols);
+    for i in 0..=nrows {
+        for c in 0..cols {
+            let above = if i > 0 { at(i - 1, c) } else { None };
+            let below = if i < nrows { at(i, c) } else { None };
+            if above.is_some() && above == below {
+                horizontal.push(None);
+                continue;
+            }
+            cand.clear();
+            push(&mut cand, above.map(|k| cells[k].node_id), Side::Bottom, 5);
+            push(&mut cand, below.map(|k| cells[k].node_id), Side::Top, 5);
+            let row_above = i.checked_sub(1).map(|r| &rows[r]);
+            let row_below = rows.get(i);
+            push(&mut cand, row_above.map(|r| r.node_id), Side::Bottom, 4);
+            push(&mut cand, row_below.map(|r| r.node_id), Side::Top, 4);
+            let (group_above, group_below) = (row_above.and_then(|r| r.group), row_below.and_then(|r| r.group));
+            if group_above != group_below {
+                push(&mut cand, group_above, Side::Bottom, 3);
+                push(&mut cand, group_below, Side::Top, 3);
+            }
+            if i == 0 {
+                push(&mut cand, Some(table_id), Side::Top, 0);
+            }
+            if i == nrows {
+                push(&mut cand, Some(table_id), Side::Bottom, 0);
+            }
+            horizontal.push(resolve_border(&cand));
+        }
+    }
+
+    let mut vertical = Vec::with_capacity(nrows * (cols + 1));
+    for r in 0..nrows {
+        for j in 0..=cols {
+            let left = if j > 0 { at(r, j - 1) } else { None };
+            let right = if j < cols { at(r, j) } else { None };
+            if left.is_some() && left == right {
+                vertical.push(None);
+                continue;
+            }
+            cand.clear();
+            push(&mut cand, left.map(|k| cells[k].node_id), Side::Right, 5);
+            push(&mut cand, right.map(|k| cells[k].node_id), Side::Left, 5);
+            let outer = match j {
+                0 => Some(Side::Left),
+                j if j == cols => Some(Side::Right),
+                _ => None,
+            };
+            if let Some(side) = outer {
+                push(&mut cand, Some(rows[r].node_id), side, 4);
+                push(&mut cand, rows[r].group, side, 3);
+                push(&mut cand, Some(table_id), side, 0);
+            }
+            vertical.push(resolve_border(&cand));
+        }
+    }
+
+    let borders = CollapsedBorders {
+        rows: nrows,
+        cols,
+        horizontal,
+        vertical,
+    };
+
+    let mut halves = Vec::with_capacity(cells.len());
+    for cell in cells.iter_mut() {
+        let r0 = (cell.row as usize).min(nrows);
+        let r1 = (r0 + cell.rowspan as usize).min(nrows);
+        let c0 = (cell.column as usize).min(cols);
+        let c1 = (c0 + cell.colspan as usize).min(cols);
+        let max = |it: &mut dyn Iterator<Item = f32>| it.fold(0.0f32, f32::max);
+        let top = max(&mut (c0..c1).map(|c| borders.hw(r0, c)));
+        let bottom = max(&mut (c0..c1).map(|c| borders.hw(r1, c)));
+        let left = max(&mut (r0..r1).map(|r| borders.vw(r, c0)));
+        let right = max(&mut (r0..r1).map(|r| borders.vw(r, c1)));
+        let half = taffy::Rect {
+            top: top / 2.0,
+            bottom: bottom / 2.0,
+            left: left / 2.0,
+            right: right / 2.0,
+        };
+        cell.style.border = half.map(style_helpers::length);
+        if let Some(node) = doc.nodes.get(cell.node_id) {
+            node.collapsed_cell_border.set(Some(half));
+        }
+        halves.push((left + right) / 2.0);
+    }
+
+    let max = |it: &mut dyn Iterator<Item = f32>| it.fold(0.0f32, f32::max);
+    let outer = taffy::Rect {
+        top: max(&mut (0..cols).map(|c| borders.hw(0, c))) / 2.0,
+        bottom: max(&mut (0..cols).map(|c| borders.hw(nrows, c))) / 2.0,
+        left: max(&mut (0..nrows).map(|r| borders.vw(r, 0))) / 2.0,
+        right: max(&mut (0..nrows).map(|r| borders.vw(r, cols))) / 2.0,
+    };
+    (borders, outer, halves)
 }
 
 /// Tracks the current column position while walking the table's cells, so that
@@ -308,6 +560,28 @@ pub(crate) fn build_table_context(
     }
     let num_columns = cursor.num_columns.max(column_sizes.len() as u16);
     column_sizes.resize(num_columns as usize, remaining_column);
+
+    // known-future: the collapsed borders of a horizontal, left-to-right table, resolved segment
+    // by segment (other writing modes keep the uniform gutters below). A column sized by a cell's
+    // content-box width also holds that cell's half borders, as the cell's padding does.
+    let collapsed = (border_collapse == BorderCollapse::Collapse && !wm.is_vertical() && wm.is_bidi_ltr())
+        .then(|| resolve_collapsed_borders(doc, table_root_node_id, &mut cells, &rows, num_columns as usize));
+    if collapsed.is_none() {
+        for cell in &cells {
+            doc.nodes[cell.node_id].collapsed_cell_border.set(None);
+        }
+    }
+    if let Some((_, _, halves)) = &collapsed {
+        for (cell, extra) in cells.iter().zip(halves) {
+            let Some(column) = column_sizes.get_mut(cell.column as usize) else {
+                continue;
+            };
+            let raw = column.max.into_raw();
+            if cell.width_sets_column && *extra != 0.0 && raw.tag() == taffy::CompactLength::LENGTH_TAG {
+                *column = style_helpers::length(raw.value() + extra);
+            }
+        }
+    }
     if is_fixed {
         // In the fixed table layout algorithm, percentage column widths resolve against
         // the table's content width minus the horizontal border-spacing between columns,
@@ -368,6 +642,7 @@ pub(crate) fn build_table_context(
         .collect();
 
     style.gap = match border_collapse {
+        _ if collapsed.is_some() => taffy::Size::ZERO.map(style_helpers::length),
         BorderCollapse::Separate => {
             // In the separated borders model, `border-spacing` also applies between
             // the table border and the outermost cells, in addition to between cells.
@@ -402,7 +677,9 @@ pub(crate) fn build_table_context(
             .unwrap_or(taffy::Size::ZERO.map(style_helpers::length)),
     };
 
-    if border_collapse == BorderCollapse::Collapse {
+    if let Some((_, outer, _)) = &collapsed {
+        style.border = outer.map(style_helpers::length);
+    } else if border_collapse == BorderCollapse::Collapse {
         style.border = taffy::Rect {
             left: style.gap.width,
             right: style.gap.width,
@@ -429,6 +706,7 @@ pub(crate) fn build_table_context(
             computed_grid_info: AtomicRefCell::new(None),
             border_collapse,
             border_style: first_cell_border,
+            collapsed: collapsed.map(|(borders, _, _)| borders),
             calc_values,
         },
         layout_children,
@@ -656,6 +934,11 @@ fn collect_table_cells(
             // Column widths from `<col>` elements take precedence over cell widths
             let col_needs_width =
                 (col as usize) >= columns.len() || columns[col as usize].max.is_auto();
+            let width_sets_column = *row == 1
+                && col_needs_width
+                && colspan == 1
+                && style.size.width.tag() == taffy::CompactLength::LENGTH_TAG
+                && style.box_sizing == taffy::BoxSizing::ContentBox;
             if *row == 1 && col_needs_width {
                 let column: TrackSizingFunction = match style.size.width.tag() {
                     taffy::CompactLength::LENGTH_TAG => {
@@ -731,6 +1014,9 @@ fn collect_table_cells(
                 node_id,
                 row: row.saturating_sub(1),
                 column: col,
+                rowspan,
+                colspan,
+                width_sets_column,
                 style,
             });
 

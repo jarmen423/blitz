@@ -752,6 +752,17 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                             },
                         );
 
+                        // known-future: a table's resolved collapsed borders, over its cells'
+                        // backgrounds
+                        if let blitz_dom::node::SpecialElementData::TableRoot(table) = &cx.element.special_data
+                            && table.collapsed.is_some()
+                        {
+                            let scrolled = cx.transform;
+                            cx.transform = unscrolled_transform;
+                            cx.draw_collapsed_table_borders(scene);
+                            cx.transform = scrolled;
+                        }
+
                         // known-future: out-of-flow boxes this stacking context paints for an outer
                         // containing block escape its overflow clip (Chrome clips a box only by the
                         // boxes on its containing-block chain), not its opacity or filter.

@@ -131,6 +131,10 @@ pub struct Node {
     /// its opacity, filter, mask and clip-path, but not inside its overflow clip, and its own box
     /// does not bound them.
     pub adopts_oof: Cell<bool>,
+    /// known-future: for a cell of a table whose borders collapse, the border widths its box holds
+    /// (half of each collapsed border, set by the table's layout); its own computed borders are not
+    /// laid out or painted then.
+    pub collapsed_cell_border: Cell<Option<taffy::Rect<f32>>>,
 
     // Flags
     pub flags: NodeFlags,
@@ -445,6 +449,7 @@ impl Node {
             stacking_context: None,
             sc_contribution_cache: RefCell::new(ThinVec::new()),
             adopts_oof: Cell::new(false),
+            collapsed_cell_border: Cell::new(None),
 
             flags: NodeFlags::empty(),
             out_of_flow: AtomicBool::new(false),
@@ -1230,15 +1235,15 @@ impl Node {
         }
 
         #[cfg(feature = "writing-mode")]
-        {
+        let mut style = {
             // Own-layout_wm by default: the node's own algorithm reads its style in its own axes
             let layout_wm = styles.writing_mode;
             stylo_taffy::TaffyStyloStyle::new_in(styles, flags, layout_wm)
-        }
+        };
         #[cfg(not(feature = "writing-mode"))]
-        {
-            stylo_taffy::TaffyStyloStyle::new(styles, flags)
-        }
+        let mut style = stylo_taffy::TaffyStyloStyle::new(styles, flags);
+        style.border_override = self.collapsed_cell_border.get();
+        style
     }
 
     /// The node's style for Taffy, expressed in the axes of the writing mode `layout_wm` (the writing
