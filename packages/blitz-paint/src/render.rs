@@ -1338,7 +1338,8 @@ impl ElementCx<'_, '_> {
         let y = y + y_offset.px() as f64;
 
         let viewport = svg_viewport_affine(svg, paint_size.width, paint_size.height);
-        let transform = (self.transform * viewport).then_translate(Vec2 { x, y });
+        // The content box offset and object-position are in the element's own space (known-future, faults round 2).
+        let transform = self.transform.pre_translate(Vec2 { x, y }) * viewport;
         if crate::PAINT_LOG.lock().unwrap().is_some() {
             if let Some(b) = svg.tree.root().abs_layer_bounding_box() {
                 let r = transform.transform_rect_bbox(kurbo::Rect::new(b.left() as f64, b.top() as f64, b.right() as f64, b.bottom() as f64));

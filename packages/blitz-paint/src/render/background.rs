@@ -566,20 +566,18 @@ impl ElementCx<'_, '_> {
             y_ratio,
         );
 
-        let transform = base_transform
-            .pre_scale_non_uniform(x_ratio, y_ratio)
-            .then_translate(Vec2 {
-                x: x.translate,
-                y: y.translate,
-            });
+        // Tiles are placed in the element's own space (before its transform), so that a scaled or
+        // rotated element scales and rotates its tiling with it (known-future, faults round 2).
         let tile_rect = Rect::new(0.0, 0.0, x.rect_len, y.rect_len);
 
         for hc in 0..y.count {
             for wc in 0..x.count {
-                let transform = transform.then_translate(Vec2 {
-                    x: wc as f64 * x.stride,
-                    y: hc as f64 * y.stride,
-                });
+                let transform = base_transform
+                    .pre_translate(Vec2 {
+                        x: x.translate + wc as f64 * x.stride,
+                        y: y.translate + hc as f64 * y.stride,
+                    })
+                    .pre_scale_non_uniform(x_ratio, y_ratio);
 
                 scene.fill(
                     peniko::Fill::NonZero,
@@ -662,16 +660,13 @@ impl ElementCx<'_, '_> {
         );
         let brush = anyrender::Paint::Gradient(&gradient);
 
-        let transform = base_transform.then_translate(Vec2 {
-            x: x.translate,
-            y: y.translate,
-        });
-
+        // Tiles are placed in the element's own space (before its transform), so that a scaled or
+        // rotated element scales and rotates its tiling with it (known-future, faults round 2).
         for hc in 0..y.count {
             for wc in 0..x.count {
-                let transform = transform.then_translate(Vec2 {
-                    x: wc as f64 * x.stride,
-                    y: hc as f64 * y.stride,
+                let transform = base_transform.pre_translate(Vec2 {
+                    x: x.translate + wc as f64 * x.stride,
+                    y: y.translate + hc as f64 * y.stride,
                 });
 
                 scene.fill(
