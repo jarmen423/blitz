@@ -301,6 +301,12 @@ fn text_hinting() -> bool {
     })
 }
 
+/// Synthetic bold on (default; FSHOT_SYNTHETIC_BOLD=0 turns it off).
+fn synthetic_bold_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !matches!(std::env::var("FSHOT_SYNTHETIC_BOLD").as_deref(), Ok("0")))
+}
+
 static GLYPH_RECTS: std::sync::Mutex<Option<Vec<Rect>>> = std::sync::Mutex::new(None);
 
 /// Start (or stop) recording the device-space box of every glyph run drawn, for a caller that needs to know
@@ -358,6 +364,33 @@ pub(crate) fn draw_glyph_run(
         }),
         AntiAliasing::Enabled,
     );
+    // Synthetic bold (a bold weight asked of a family that has no bold face), as Chrome draws it on Linux:
+    // Skia's fake bold, the outline grown by a stroke of font size x (1/24 at 9 px .. 1/32 at 36 px), miter joins.
+    // (FONT_EMBOLDEN_ENABLED builds embolden every glyph run already.)
+    if !FONT_EMBOLDEN_ENABLED && run.synthesis().embolden() && synthetic_bold_enabled() {
+        let fs = font_size as f64;
+        let t = ((fs - 9.0) / 27.0).clamp(0.0, 1.0);
+        let width = fs * (1.0 / 24.0 + (1.0 / 32.0 - 1.0 / 24.0) * t);
+        let stroke = kurbo::Stroke::new(width).with_join(kurbo::Join::Miter).with_miter_limit(4.0);
+        scene.draw_glyphs(
+            run.font(),
+            font_size,
+            text_hinting(),
+            normalized_coords,
+            kurbo::Vec2::default(),
+            &stroke,
+            &anyrender::Paint::from(color),
+            1.0,
+            transform,
+            glyph_xform,
+            glyph_run.positioned_glyphs().map(|glyph| anyrender::Glyph {
+                id: glyph.id as _,
+                x: glyph.x,
+                y: glyph.y,
+            }),
+            AntiAliasing::Enabled,
+        );
+    }
     if let Some(v) = GLYPH_RECTS.lock().unwrap().as_mut() {
         let r = glyph_run_rect(glyph_run);
         let r = Rect::new(r.x0 - font_size as f64 * 0.5, r.y0 - font_size as f64 * 0.25, r.x1 + font_size as f64 * 0.5, r.y1 + font_size as f64 * 0.25);
