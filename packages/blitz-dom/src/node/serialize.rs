@@ -37,6 +37,34 @@ impl SerializeOpts {
 
 const XLINK_NS: &str = "http://www.w3.org/1999/xlink";
 
+/// A style attribute's declarations without `opacity` (split at semicolons outside parentheses and quotes).
+#[cfg(feature = "svg")]
+fn style_without_opacity(style: &str) -> String {
+    let mut decls: Vec<&str> = Vec::new();
+    let (mut depth, mut quote, mut start) = (0i32, None::<char>, 0usize);
+    for (i, c) in style.char_indices() {
+        match (quote, c) {
+            (Some(q), _) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '"') | (None, '\'') => quote = Some(c),
+            (None, '(') => depth += 1,
+            (None, ')') => depth -= 1,
+            (None, ';') if depth <= 0 => {
+                decls.push(&style[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    decls.push(&style[start..]);
+    decls
+        .into_iter()
+        .map(str::trim)
+        .filter(|d| !d.is_empty() && !d.split(':').next().unwrap_or("").trim().eq_ignore_ascii_case("opacity"))
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
 /// Writes an attribute's serialized name, per the HTML fragment serialization algorithm
 fn write_attr_name(name: &QualName, writer: &mut String) {
     match name.ns {
@@ -190,6 +218,24 @@ impl Node {
                         && attr.name.ns == ns!()
                         && attr.name.local == local_name!("transform")
                     {
+                        continue;
+                    }
+                    // The root's `opacity` set in its style attribute is the element's CSS opacity, which the
+                    // box is painted with; usvg read it again and multiplied it in (a shadow <svg style="...;
+                    // opacity:0"> faded in by GSAP stayed invisible: prepare's `opacity:1 !important` reached the
+                    // box, not the style attribute usvg reads). The `opacity` attribute is usvg's alone.
+                    if opts.skip_root_transform
+                        && nesting == 0
+                        && attr.name.ns == ns!()
+                        && attr.name.local == local_name!("style")
+                        && attr.value.to_ascii_lowercase().contains("opacity")
+                    {
+                        let kept = style_without_opacity(&attr.value);
+                        if !kept.trim().is_empty() {
+                            writer.push_str(" style=\"");
+                            encode_quoted_attribute_to_string(&kept, writer);
+                            writer.push('"');
+                        }
                         continue;
                     }
                     writer.push(' ');
