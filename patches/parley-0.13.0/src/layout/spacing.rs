@@ -190,6 +190,12 @@ impl EffectiveSpacing {
     #[inline(always)]
     pub(crate) fn gaps(self, atom: &Atom<'_>) -> Gaps {
         let first_cluster = atom.shaped_clusters()[0];
+        // known-future: an inline object (an atomic inline box's U+FFFC) takes no letter or word
+        // spacing: Blink adds none after an inline-block, so `letter-spacing` on the parent left
+        // a row of inline-block words narrower than Chrome's (Chrome 152).
+        if first_cluster.is_inline_object() {
+            return Gaps::ZERO;
+        }
         let whitespace = first_cluster.whitespace();
         let mut gaps = self
             .spacing
