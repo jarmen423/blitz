@@ -47,6 +47,10 @@ pub(crate) fn build_inline_layout_into(
 
     // Create a parley tree builder
     let mut builder = layout_ctx.tree_builder(font_ctx, scale, true, &parley_style);
+    // Break lines where Blink does: after every run of spaces, whatever follows (UAX 14's LB13 forbids a break
+    // before . , ! ? ) ] } ; : / even after a space, so "durable . . . maintaining" broke elsewhere), and with
+    // Blink's table for pairs of ASCII characters ("-" before a digit, "/", ...). parley ships it ready-made.
+    builder.set_line_break_override(Some(parley::CHROMIUM_LINE_BREAK_OVERRIDE));
     if let Some(style) = root_node_style.as_deref() {
         builder.set_base_direction(stylo_to_parley::base_direction(
             style.clone_direction(),
