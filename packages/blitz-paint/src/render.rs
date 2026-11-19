@@ -3,6 +3,7 @@ mod border;
 mod box_shadow;
 mod clip_path;
 mod form_controls;
+mod inline_box;
 mod mask;
 
 use blitz_dom::CopyStyleGetters;
@@ -1050,14 +1051,13 @@ impl ElementCx<'_, '_> {
             let transform =
                 self.transform * Affine::translate((pos.x * self.scale, pos.y * self.scale));
 
-            // Render inline element backgrounds (e.g. `<span style="background: ...">`)
-            // behind the text and selection highlight.
-            crate::text::draw_inline_backgrounds(
+            // Render inline element backgrounds and borders (e.g. `<span style="background: ...">`)
+            // behind the text and selection highlight, over their descendants' fragments too.
+            self.draw_inline_box_decorations(
                 scene,
-                text_layout.layout.lines(),
-                self.context.dom,
+                &text_layout.layout,
                 transform,
-                self.node.id,
+                Vec2::new(pos.x * self.scale, pos.y * self.scale),
             );
 
             // Render text selection highlight (if any) using cached selection ranges

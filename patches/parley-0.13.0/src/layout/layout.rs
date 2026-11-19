@@ -6,7 +6,7 @@ use crate::InlineBox;
 use crate::layout::data::LayoutData;
 use crate::layout::style_metrics::StyleMetrics;
 use crate::layout::{
-    ContentWidths, SpanMetrics, Style, alignment::Alignment, alignment::AlignmentOptions,
+    ContentWidths, SpanMetrics, Style, StyleSpanBox, alignment::Alignment, alignment::AlignmentOptions,
     line::Line, line_break::BreakLines,
 };
 use crate::style::Brush;
@@ -80,6 +80,18 @@ impl<B: Brush> Layout<B> {
             .style_metrics
             .first()
             .map(StyleMetrics::span_metrics)
+    }
+
+    /// known-future: the span box that style `index` generates (an inline element, in CSS terms),
+    /// for painting its background and border over its fragments. `None` before the layout is
+    /// built or when `index` is out of range.
+    pub fn style_span_box(&self, index: usize) -> Option<StyleSpanBox> {
+        self.data.style_metrics.get(index).map(|m| StyleSpanBox {
+            metrics: m.span_metrics(),
+            parent: usize::from(m.parent),
+            baseline_offset: m.baseline_offset,
+            aligned_subtree_root: usize::from(m.aligned_subtree_root),
+        })
     }
 
     /// Returns the length of the source text, in bytes.
