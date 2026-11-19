@@ -1362,6 +1362,31 @@ impl Node {
             .unwrap_or(0)
     }
 
+    /// known-future: whether this is a non-atomic inline element (`display: inline`, not a replaced
+    /// or form element) with `position: relative` or `sticky` and `z-index` auto or 0. CSS 2.1
+    /// Appendix E paints such an element (its inline boxes and its text) at the positioned level,
+    /// in tree order with the other positioned descendants, not with the in-flow text around it.
+    pub fn is_positioned_inline(&self) -> bool {
+        use style::values::specified::box_::{DisplayInside, DisplayOutside};
+        let Some(element) = self.element_data() else {
+            return false;
+        };
+        if self.flags.is_inline_root()
+            || element.name.local == local_name!("br")
+            || crate::layout::replaced::is_inline_box_element(&element.name.local)
+        {
+            return false;
+        }
+        let Some(style) = self.primary_styles() else {
+            return false;
+        };
+        let display = style.clone_display();
+        display.outside() == DisplayOutside::Inline
+            && display.inside() == DisplayInside::Flow
+            && matches!(style.clone_position(), Position::Relative | Position::Sticky)
+            && style.clone_z_index().integer_or(0) == 0
+    }
+
     pub fn z_index(&self) -> i32 {
         self.primary_styles()
             .map(|s| s.clone_z_index().integer_or(0))

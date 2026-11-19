@@ -414,6 +414,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                     },
                     node.id,
                     &mut self.draw_text_context.borrow_mut(),
+                    None,
                 );
             }
         }
@@ -1053,11 +1054,17 @@ impl ElementCx<'_, '_> {
 
             // Render inline element backgrounds and borders (e.g. `<span style="background: ...">`)
             // behind the text and selection highlight, over their descendants' fragments too.
+            let positioned = self.positioned_inline_owners(&text_layout.layout);
+            let filter = positioned.as_ref().map(|(_, owners)| crate::text::RunFilter {
+                owners,
+                want: crate::text::NO_OWNER,
+            });
             self.draw_inline_box_decorations(
                 scene,
                 &text_layout.layout,
                 transform,
                 Vec2::new(pos.x * self.scale, pos.y * self.scale),
+                filter,
             );
 
             // Render text selection highlight (if any) using cached selection ranges
@@ -1084,6 +1091,7 @@ impl ElementCx<'_, '_> {
                 },
                 self.node.id,
                 &mut draw_text_context,
+                filter,
             );
         }
     }
@@ -1156,6 +1164,7 @@ impl ElementCx<'_, '_> {
                 },
                 self.node.id,
                 &mut draw_text_context,
+                None,
             );
         }
     }
@@ -1215,6 +1224,7 @@ impl ElementCx<'_, '_> {
                 },
                 self.node.id,
                 &mut draw_text_context,
+                None,
             );
         }
     }
@@ -1251,6 +1261,12 @@ impl ElementCx<'_, '_> {
                 // scroll (applied in `paint_scene`). A fixed box contained by a
                 // transformed ancestor scrolls with it like any out-of-flow box.
                 let child = &self.context.dom.as_ref().tree()[*child_id];
+                // known-future: a positioned inline element of this inline formatting context,
+                // painted apart from the in-flow text at its place in the positioned level.
+                if child.is_positioned_inline() {
+                    self.draw_positioned_inline(scene, *child_id);
+                    continue;
+                }
                 let child_transform = if child.taffy_position() == taffy::Position::Fixed
                     && Some(self.node.id) == self.context.root_element_id
                 {

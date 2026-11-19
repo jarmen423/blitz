@@ -320,7 +320,22 @@ impl BaseDocument {
                 stacking_context.is_none() || self.nodes[node_id].is_paint_layer_root();
             let keyed_base = self.scratch.keyed_children.len();
 
+            // known-future: relatively positioned inline elements of this node's inline formatting
+            // context join its positioned paint level in tree order (blitz-paint paints them apart
+            // from the in-flow text), when this node paints its positioned descendants itself.
+            let mut positioned_inlines: Vec<(usize, NodeId)> = Vec::new();
+            if is_layer_root && self.nodes[node_id].flags.is_inline_root() {
+                self.positioned_inlines(node_id, &children, &mut positioned_inlines);
+            }
+            let mut next_positioned_inline = 0;
+
             for (index, &child_id) in children.iter().enumerate() {
+                while let Some(&(anchor, inline_id)) = positioned_inlines.get(next_positioned_inline)
+                    && anchor <= index
+                {
+                    self.scratch.keyed_children.push(((2, 0), inline_id));
+                    next_positioned_inline += 1;
+                }
                 if owned_here(self, child_id) {
                     let is_sc_root = self.nodes[child_id].is_stacking_context_root(is_flex_or_grid);
                     let first_entry = entries.len();
@@ -376,6 +391,9 @@ impl BaseDocument {
             for &(_, hoisted_id) in &hoisted_past_parent[next_hoisted..] {
                 self.attach_hoisted_past_parent(hoisted_id, is_flex_or_grid, &mut entries);
             }
+            for &(_, inline_id) in &positioned_inlines[next_positioned_inline..] {
+                self.scratch.keyed_children.push(((2, 0), inline_id));
+            }
 
             self.scratch.keyed_children[keyed_base..].sort_by_key(|&(paint_order, _)| paint_order);
 
@@ -406,6 +424,41 @@ impl BaseDocument {
             node.sc_contribution_cache.borrow_mut().clear();
             node.stacking_context = Some(Box::new(StackingContext::from_children(entries)));
         }
+    }
+
+    /// known-future: the positioned inline elements (`Node::is_positioned_inline`) of the inline
+    /// formatting context rooted at `node_id`, in tree order, each with the number of its layout
+    /// `children` (its atomic inlines and out-of-flow boxes, also in tree order) that come before it.
+    /// Their own descendants are painted with them.
+    fn positioned_inlines(&self, node_id: NodeId, children: &[NodeId], out: &mut Vec<(usize, NodeId)>) {
+        use style::values::specified::box_::DisplayOutside;
+        fn walk(doc: &BaseDocument, id: NodeId, children: &[NodeId], seen: &mut usize, out: &mut Vec<(usize, NodeId)>) {
+            let node = &doc.nodes[id];
+            let kids = node.before().into_iter().chain(node.children.iter().copied()).chain(node.after());
+            for child_id in kids {
+                if let Some(k) = children.iter().position(|&c| c == child_id) {
+                    *seen = k + 1;
+                    continue;
+                }
+                let child = &doc.nodes[child_id];
+                if child.element_data().is_none() {
+                    continue;
+                }
+                if child.is_positioned_inline() {
+                    out.push((*seen, child_id));
+                    continue;
+                }
+                let Some(display) = child.display_style() else {
+                    continue;
+                };
+                match (display.outside(), display.inside()) {
+                    (DisplayOutside::Inline, DisplayInside::Flow)
+                    | (DisplayOutside::None, DisplayInside::Contents) => walk(doc, child_id, children, seen, out),
+                    _ => {}
+                }
+            }
+        }
+        walk(self, node_id, children, &mut 0, out);
     }
 
     /// The layout child of `node_id` whose subtree contains `id`, following

@@ -12,6 +12,25 @@ use crate::text_decorations::{
 };
 use crate::{FONT_EMBOLDEN_ENABLED, SELECTION_COLOR};
 
+/// known-future: which glyph runs of an inline layout to paint: those whose style's entry in
+/// `owners` (one per style of the layout) is `want`. Used to paint the text of a positioned
+/// inline element apart from the in-flow text around it (see `render/inline_box.rs`).
+#[derive(Clone, Copy)]
+pub(crate) struct RunFilter<'a> {
+    pub(crate) owners: &'a [u32],
+    pub(crate) want: u32,
+}
+
+/// No positioned inline element owns the style (see [`RunFilter`]).
+pub(crate) const NO_OWNER: u32 = u32::MAX;
+
+impl RunFilter<'_> {
+    #[inline]
+    pub(crate) fn keeps(&self, style_index: usize) -> bool {
+        self.owners.get(style_index).copied().unwrap_or(NO_OWNER) == self.want
+    }
+}
+
 /// Per glyph run values recorded while walking a line, so the line can be painted in
 /// passes (shadows beneath, then glyphs) without re-resolving styles.
 pub(crate) struct RunRecord {
@@ -44,6 +63,7 @@ pub(crate) fn stroke_text<'a>(
     options: TextPaintOptions,
     inline_root_id: NodeId,
     context: &mut DrawTextContext,
+    filter: Option<RunFilter<'_>>,
 ) {
     let TextPaintOptions {
         scale,
@@ -80,10 +100,7 @@ pub(crate) fn stroke_text<'a>(
         // Pass 1: resolve styles for every glyph run on the line (recording the values
         // needed to paint it) and accumulate decorations. Painting is deferred so text
         // shadows can be drawn beneath *all* of the line's text and decorations.
-        for item in line.items() {
-            let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
-                continue;
-            };
+        for glyph_run in glyph_runs(&line, filter) {
             let run = glyph_run.run();
             let font = run.font();
             let font_size = run.font_size();
@@ -195,11 +212,12 @@ pub(crate) fn stroke_text<'a>(
                 transform,
                 options,
                 inline_root_id,
+                filter,
             );
         }
 
         // Pass 3: the glyphs themselves.
-        for (glyph_run, record) in glyph_runs(&line).zip(run_records.iter()) {
+        for (glyph_run, record) in glyph_runs(&line, filter).zip(run_records.iter()) {
             draw_glyph_run(scene, &glyph_run, record.fill_color, transform);
         }
 
@@ -217,13 +235,19 @@ pub(crate) fn stroke_text<'a>(
     }
 }
 
-/// The glyph runs of a line, in order (matching the order of the recorded `RunRecord`s).
-pub(crate) fn glyph_runs<'a, 'b>(
+/// The glyph runs of a line that `filter` keeps (all without one), in order (matching the order
+/// of the recorded `RunRecord`s).
+pub(crate) fn glyph_runs<'a, 'b, 'f: 'b>(
     line: &'b Line<'a, TextBrush>,
+    filter: Option<RunFilter<'f>>,
 ) -> impl Iterator<Item = GlyphRun<'a, TextBrush>> + 'b {
-    line.items().filter_map(|item| match item {
-        PositionedLayoutItem::GlyphRun(glyph_run) => Some(glyph_run),
-        PositionedLayoutItem::InlineBox(_) => None,
+    line.items().filter_map(move |item| match item {
+        PositionedLayoutItem::GlyphRun(glyph_run)
+            if filter.is_none_or(|f| f.keeps(glyph_run.style_index() as usize)) =>
+        {
+            Some(glyph_run)
+        }
+        _ => None,
     })
 }
 

@@ -16,18 +16,19 @@
 
 use super::ElementCx;
 use crate::color::{Color, ToColorColor as _};
+use crate::text::{NO_OWNER, RunFilter, TextPaintOptions};
 use crate::kurbo_css::{CssBox, NonUniformRoundedRectRadii};
 use anyrender::PaintScene;
 use blitz_dom::node::TextBrush;
 use blitz_dom::{BaseDocument, CopyStyleGetters, Node, NodeId};
-use kurbo::{Affine, Insets, Rect, Vec2};
+use kurbo::{Affine, Insets, Point, Rect, Vec2};
 use parley::{Layout as TextLayout, PositionedLayoutItem};
 use peniko::BlendMode;
 use style::properties::ComputedValues;
 use style::properties::generated::longhands::background_clip::single_value::computed_value::T as StyloBackgroundClip;
 use style::properties::generated::longhands::visibility::computed_value::T as StyloVisibility;
 use style::servo_arc::Arc;
-use style::values::computed::{BorderCornerRadius, BorderStyle, BoxDecorationBreak, CSSPixelLength};
+use style::values::computed::{BorderCornerRadius, BorderStyle, BoxDecorationBreak, CSSPixelLength, Inset};
 use style::values::generics::image::GenericImage;
 use style::values::specified::box_::{DisplayInside, DisplayOutside};
 
@@ -114,14 +115,15 @@ fn side(style: BorderStyle, width: &style::values::computed::BorderSideWidth) ->
 
 impl<'dom, 'a> ElementCx<'dom, 'a> {
     /// Paint the backgrounds and borders of the inline boxes of this inline formatting context
-    /// (the inline root's own box is painted as a block). `transform` maps the layout's
-    /// coordinates to the scene, and is this element's transform moved by `origin`.
+    /// (the inline root's own box is painted as a block), or of those `filter` keeps. `transform`
+    /// maps the layout's coordinates to the scene, and is this element's transform moved by `origin`.
     pub(super) fn draw_inline_box_decorations(
         &self,
         scene: &mut impl PaintScene,
         layout: &TextLayout<TextBrush>,
         transform: Affine,
         origin: Vec2,
+        filter: Option<RunFilter<'_>>,
     ) {
         let doc = self.context.dom;
         let root = self.node.id;
@@ -131,7 +133,7 @@ impl<'dom, 'a> ElementCx<'dom, 'a> {
         let mut decos: Vec<Decorated<'dom>> = Vec::new();
         for (i, st) in styles.iter().enumerate().skip(1) {
             let id = st.brush.id;
-            if id == root {
+            if id == root || filter.is_some_and(|f| !f.keeps(i)) {
                 continue;
             }
             let Some(sb) = layout.style_span_box(i) else { continue };
@@ -317,5 +319,132 @@ impl<'dom, 'a> ElementCx<'dom, 'a> {
             cx.draw_border(scene);
             self.context.layer_manager.maybe_pop_layer(scene, faded);
         }
+    }
+
+    /// The positioned inline elements this inline root paints apart from its in-flow text (those in
+    /// its paint list, see blitz-dom's paint tree) and, for each style of its text layout, the index
+    /// of the one it belongs to ([`NO_OWNER`]: none). `None` when there are none.
+    pub(super) fn positioned_inline_owners(&self, layout: &TextLayout<TextBrush>) -> Option<(Vec<NodeId>, Vec<u32>)> {
+        let doc = self.context.dom;
+        let children = self.node.paint_children.borrow();
+        let positioned: Vec<NodeId> = children
+            .as_ref()?
+            .iter()
+            .copied()
+            .filter(|id| doc.get_node(*id).is_some_and(|n| n.is_positioned_inline()))
+            .collect();
+        if positioned.is_empty() {
+            return None;
+        }
+        let styles = layout.styles();
+        let mut owners = vec![NO_OWNER; styles.len()];
+        for i in 1..styles.len() {
+            owners[i] = match positioned.iter().position(|p| *p == styles[i].brush.id) {
+                Some(k) => k as u32,
+                None => layout
+                    .style_span_box(i)
+                    .filter(|sb| sb.parent < i)
+                    .map_or(NO_OWNER, |sb| owners[sb.parent]),
+            };
+        }
+        Some((positioned, owners))
+    }
+
+    /// Paint the positioned inline element `id` of this inline formatting context at its place in
+    /// the positioned paint level (CSS 2.1 Appendix E): its inline boxes and the text of it and its
+    /// descendants, moved by its relative offset, with its opacity. It is also recorded in the
+    /// paint log as a box covering its fragments, so a caller of the log sees it in paint order.
+    pub(super) fn draw_positioned_inline(&self, scene: &mut impl PaintScene, id: NodeId) {
+        let Some(text_layout) = self.element.inline_layout_data.as_ref() else { return };
+        let layout = &text_layout.layout;
+        let Some((positioned, owners)) = self.positioned_inline_owners(layout) else { return };
+        let Some(k) = positioned.iter().position(|p| *p == id) else { return };
+        let Some(node) = self.context.dom.get_node(id) else { return };
+        let Some(style) = node.primary_styles() else { return };
+        if style.get_inherited_box().visibility != StyloVisibility::Visible {
+            return;
+        }
+        let opacity = style.get_effects().opacity;
+        if opacity == 0.0 {
+            return;
+        }
+        let filter = RunFilter { owners: &owners, want: k as u32 };
+        let scale = self.scale;
+
+        // Where draw_inline_layout puts the text, plus the relative offset.
+        let lb = self.node.final_layout();
+        let scroll = self.node.scroll_offset();
+        let subpixel = text_layout.content_box_subpixel_offset;
+        let pos = Point {
+            x: (lb.padding.left + lb.border.left) as f64 - scroll.x + subpixel.x as f64,
+            y: (lb.padding.top + lb.border.top) as f64 - scroll.y + subpixel.y as f64 + text_layout.block_offset as f64,
+        };
+        let content = self.frame.content_box();
+        let inset = |v: &Inset, basis: f64| -> Option<f64> {
+            match v {
+                Inset::LengthPercentage(lp) => Some(lp.resolve(CSSPixelLength::new(basis as f32)).px() as f64),
+                _ => None,
+            }
+        };
+        let sp = style.get_position();
+        let (cw, ch) = (content.width() / scale, content.height() / scale);
+        let dx = inset(&sp.left, cw).or_else(|| inset(&sp.right, cw).map(|r| -r)).unwrap_or(0.0);
+        let dy = inset(&sp.top, ch).or_else(|| inset(&sp.bottom, ch).map(|b| -b)).unwrap_or(0.0);
+        let origin = Vec2::new((pos.x + dx) * scale, (pos.y + dy) * scale);
+        let transform = self.transform * Affine::translate(origin);
+
+        // Its extent: the runs of it and its descendants, each line's box height at least.
+        let mut bbox: Option<Rect> = None;
+        for line in layout.lines() {
+            let m = line.metrics();
+            for run in crate::text::glyph_runs(&line, Some(filter)) {
+                let fm = run.run().font_metrics();
+                let b = run.baseline() as f64;
+                let r = Rect::new(
+                    run.offset() as f64,
+                    (b - fm.ascent as f64).min(m.block_min_coord as f64),
+                    (run.offset() + run.advance()) as f64,
+                    (b + fm.descent as f64).max(m.block_max_coord as f64),
+                );
+                bbox = Some(bbox.map_or(r, |u| u.union(r)));
+            }
+        }
+        let Some(bbox) = bbox else { return };
+        let screen = Affine::translate(Vec2::new(-self.context.initial_x, -self.context.initial_y)) * transform;
+        if let Some(log) = crate::PAINT_LOG.lock().unwrap().as_mut() {
+            let sb = screen.transform_rect_bbox(bbox);
+            log.push((
+                id,
+                (transform * Affine::translate(Vec2::new(bbox.x0, bbox.y0))).as_coeffs(),
+                bbox.width() / scale,
+                bbox.height() / scale,
+                [sb.x0, sb.y0, sb.x1, sb.y1],
+            ));
+        }
+
+        let pushed = self.context.layer_manager.maybe_push_layer(
+            scene,
+            opacity < 1.0,
+            BlendMode::default(),
+            opacity,
+            transform,
+            &bbox.inflate(4.0 * scale, 4.0 * scale + bbox.height()),
+            None,
+            None,
+        );
+        self.draw_inline_box_decorations(scene, layout, transform, origin, Some(filter));
+        let mut cx = self.context.draw_text_context.borrow_mut();
+        crate::text::stroke_text(
+            scene,
+            layout.lines(),
+            self.context.dom,
+            transform,
+            TextPaintOptions { scale, brush_override: None },
+            self.node.id,
+            &mut cx,
+            Some(filter),
+        );
+        drop(cx);
+        self.context.layer_manager.maybe_pop_layer(scene, pushed);
     }
 }
