@@ -52,7 +52,7 @@ pub fn hoisted_child_position(tree: &NodeTree, sc_root_id: NodeId, child_id: Nod
 
     while let Some(id) = current {
         if id == sc_root_id {
-            break;
+            return position;
         }
         let Some(node) = tree.get(id) else {
             break;
@@ -63,7 +63,28 @@ pub fn hoisted_child_position(tree: &NodeTree, sc_root_id: NodeId, child_id: Nod
         position.y += location.y - scroll_offset.y as f32;
         current = node.containing_block();
     }
-    position
+
+    // known-future: `sc_root_id` is not on the child's containing-block chain. It is then a
+    // stacking context between the child and its containing block that paints the child
+    // (`adopted_oof`): `position` now runs to the top of the tree, so take off where the
+    // painter's own (scrolled) content origin is, measured the same way.
+    let Some(painter) = tree.get(sc_root_id) else {
+        return position;
+    };
+    let mut painter_position = painter.final_layout().location;
+    let mut current = painter.containing_block();
+    while let Some(node) = current.and_then(|id| tree.get(id)) {
+        let location = node.final_layout().location;
+        let scroll_offset = *node.scroll_offset();
+        painter_position.x += location.x - scroll_offset.x as f32;
+        painter_position.y += location.y - scroll_offset.y as f32;
+        current = node.containing_block();
+    }
+    let painter_scroll = *painter.scroll_offset();
+    Point {
+        x: position.x - painter_position.x + painter_scroll.x as f32,
+        y: position.y - painter_position.y + painter_scroll.y as f32,
+    }
 }
 
 /// A child with a z_index that is hoisted up to it's containing Stacking Context for paint purposes
@@ -214,7 +235,38 @@ impl BaseDocument {
     /// own lists are still valid and the entries they contributed to the
     /// enclosing stacking context are replayed from `Node::sc_contribution_cache`.
     pub(crate) fn build_paint_tree(&mut self, root_id: NodeId) {
+        self.scratch.adopted_oof.clear();
         self.build_paint_tree_impl(root_id, None);
+        // Entries left for stacking contexts skipped as clean: their lists already hold them.
+        self.scratch.adopted_oof.clear();
+    }
+
+    /// known-future: the stacking context that paints the out-of-flow box `id`, when it is not its
+    /// containing block `cb`: the nearest ancestor between the two (on the layout-parent chain)
+    /// that is a stacking-context root. CSS 2.1 Appendix E paints a positioned box in the stacking
+    /// context it belongs to, whatever its containing block, so an `opacity` (or `clip-path`,
+    /// `mask`, `filter`, `isolation`, `mix-blend-mode`, a z-indexed flex item) on an unpositioned
+    /// element between them applies to it: `<div style="position:relative"><div style="opacity:0">
+    /// <div style="position:absolute;inset:0">` is hidden in Chrome. Before this, such a box was
+    /// listed and painted only by its containing block, outside the effect.
+    fn oof_adopter(&self, cb: NodeId, id: NodeId) -> Option<NodeId> {
+        let mut current = self.nodes.get(id)?.layout_parent.get();
+        while let Some(ancestor) = current {
+            if ancestor == cb {
+                return None;
+            }
+            let node = self.nodes.get(ancestor)?;
+            let parent = node.layout_parent.get();
+            let parent_is_flex_or_grid = parent
+                .and_then(|p| self.nodes.get(p))
+                .and_then(|p| p.display_style())
+                .is_some_and(|d| matches!(d.inside(), DisplayInside::Flex | DisplayInside::Grid));
+            if node.is_stacking_context_root(parent_is_flex_or_grid) {
+                return Some(ancestor);
+            }
+            current = parent;
+        }
+        None
     }
 
     /// `stacking_context` is the entry list of the nearest ancestor stacking
@@ -295,7 +347,7 @@ impl BaseDocument {
             // and listed in tree order, directly after that child (CSS 2.1
             // Appendix E). Boxes whose layout-parent chain does not lead through
             // a layout child of this node come after all of them.
-            let mut hoisted_past_parent: Vec<(usize, NodeId)> = self.nodes[node_id]
+            let past_parent: Vec<NodeId> = self.nodes[node_id]
                 .hoisted_children
                 .borrow()
                 .iter()
@@ -305,14 +357,31 @@ impl BaseDocument {
                         .get(id)
                         .is_some_and(|n| n.layout_parent.get() != Some(node_id))
                 })
-                .map(|id| {
-                    let anchor = self
-                        .layout_child_containing(node_id, id)
-                        .and_then(|anchor| children.iter().position(|&c| c == anchor))
-                        .unwrap_or(children.len());
-                    (anchor, id)
-                })
                 .collect();
+            // known-future: a box with a stacking context between it and this node (its containing
+            // block) is painted by that stacking context (`oof_adopter`), which lists it with the
+            // boxes it adopts, in tree order after the layout child they descend from.
+            let adopted = match self.scratch.adopted_oof.is_empty() {
+                true => Vec::new(),
+                false => self.scratch.adopted_oof.remove(&node_id).unwrap_or_default(),
+            };
+            self.nodes[node_id].adopts_oof.set(!adopted.is_empty());
+            let mut hoisted_past_parent: Vec<(usize, NodeId)> =
+                Vec::with_capacity(past_parent.len() + adopted.len());
+            for id in past_parent {
+                if let Some(adopter) = self.oof_adopter(node_id, id) {
+                    self.scratch.adopted_oof.entry(adopter).or_default().push(id);
+                    continue;
+                }
+                hoisted_past_parent.push((0, id));
+            }
+            hoisted_past_parent.extend(adopted.into_iter().map(|id| (0, id)));
+            for entry in hoisted_past_parent.iter_mut() {
+                entry.0 = self
+                    .layout_child_containing(node_id, entry.1)
+                    .and_then(|anchor| children.iter().position(|&c| c == anchor))
+                    .unwrap_or(children.len());
+            }
             hoisted_past_parent.sort_by_key(|&(anchor, _)| anchor);
             let mut next_hoisted = 0;
 

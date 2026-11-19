@@ -377,6 +377,10 @@ pub(crate) struct DocumentScratch {
     /// `(paint order, node)` pairs of the paint lists under construction in
     /// `build_paint_tree_impl`.
     pub(crate) keyed_children: Vec<((i32, i32), NodeId)>,
+    /// known-future: out-of-flow boxes waiting to be listed by the stacking context that paints
+    /// them (keyed by that stacking context), set by their containing block in
+    /// `build_paint_tree_impl`, see `oof_adopter`.
+    pub(crate) adopted_oof: HashMap<NodeId, Vec<NodeId>>,
 }
 
 bitflags! {

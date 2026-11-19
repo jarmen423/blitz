@@ -125,6 +125,12 @@ pub struct Node {
     /// stacking context on its last (non-skipped) paint-tree build. Replayed
     /// when the subtree is skipped as clean. Empty for stacking-context roots.
     pub sc_contribution_cache: RefCell<ThinVec<HoistedPaintChild>>,
+    /// known-future: whether `paint_children` (or the stacking context) holds out-of-flow boxes
+    /// whose containing block is an ancestor of this node, which this node paints because it is
+    /// the stacking context they belong to (see `paint_tree::oof_adopter`). They are drawn inside
+    /// its opacity, filter, mask and clip-path, but not inside its overflow clip, and its own box
+    /// does not bound them.
+    pub adopts_oof: Cell<bool>,
 
     // Flags
     pub flags: NodeFlags,
@@ -438,6 +444,7 @@ impl Node {
             paint_children: RefCell::new(None),
             stacking_context: None,
             sc_contribution_cache: RefCell::new(ThinVec::new()),
+            adopts_oof: Cell::new(false),
 
             flags: NodeFlags::empty(),
             out_of_flow: AtomicBool::new(false),
@@ -1811,6 +1818,24 @@ impl Node {
         self.oof_containing_block
             .get()
             .or_else(|| self.layout_parent.get())
+    }
+
+    /// known-future: whether this out-of-flow box is painted by `painter_id` without `painter_id`
+    /// being on its containing-block chain (a stacking context that adopted it, see
+    /// `adopts_oof`).
+    pub fn is_adopted_by(&self, painter_id: NodeId) -> bool {
+        if !self.taffy_position().is_out_of_flow() {
+            return false;
+        }
+        let tree = self.tree();
+        let mut current = self.containing_block();
+        while let Some(id) = current {
+            if id == painter_id {
+                return false;
+            }
+            current = tree.get(id).and_then(|n| n.containing_block());
+        }
+        true
     }
 
     /// Computes the Document-relative coordinates of the `Node`

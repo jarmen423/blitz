@@ -528,10 +528,14 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         // Cull elements that fall entirely outside the current clip rectangle. In addition to
         // the viewport, `clip_rect` is narrowed by any ancestor scrollport (see below), so this
         // also culls elements scrolled out of view inside a clipping/scrolling container.
-        if !recording && (screen_bbox.x1 < clip_rect.x0)
-            || !recording && screen_bbox.x0 > clip_rect.x1
-            || !recording && screen_bbox.y1 < clip_rect.y0
-            || !recording && screen_bbox.y0 > clip_rect.y1
+        // known-future: a stacking context that paints out-of-flow boxes of an outer containing
+        // block (`Node::adopts_oof`) is not bounded by its own box and overflow: not culled.
+        let adopts_oof = node.adopts_oof.get();
+        if !adopts_oof
+            && (!recording && (screen_bbox.x1 < clip_rect.x0)
+                || !recording && screen_bbox.x0 > clip_rect.x1
+                || !recording && screen_bbox.y1 < clip_rect.y0
+                || !recording && screen_bbox.y0 > clip_rect.y1)
         {
             return;
         }
@@ -557,7 +561,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         let clip_area = content_box_size.width * content_box_size.height;
         let overflow_area =
             node.scrollable_overflow().width() * node.scrollable_overflow().height();
-        if should_clip && clip_area < 0.01 && overflow_area < 0.01 {
+        if should_clip && clip_area < 0.01 && overflow_area < 0.01 && !adopts_oof {
             return;
         }
 
@@ -679,7 +683,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                 effect_layer_clip.y1 += filter_expansion_area.y1;
                 // Local patch (fries fidelity test): an opacity-only layer on a box that doesn't clip its
                 // children must not clip them either (Chrome lets them overflow). Upstream TODO below.
-                if filter.is_none() && backdrop_filter.is_none() && !should_clip {
+                if filter.is_none() && backdrop_filter.is_none() && (!should_clip || adopts_oof) {
                     effect_layer_clip = Rect::new(-1.0e6, -1.0e6, 1.0e6, 1.0e6);
                 }
 
@@ -741,9 +745,19 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                                 cx.draw_text_input_text(scene, content_position);
                                 cx.draw_inline_layout(scene, content_position);
                                 cx.draw_marker(scene, content_position);
-                                cx.draw_children(scene, cx.transform, child_clip_rect);
+                                match should_clip && adopts_oof {
+                                    false => cx.draw_children(scene, cx.transform, child_clip_rect),
+                                    true => cx.draw_children_part(scene, cx.transform, child_clip_rect, Some(false)),
+                                }
                             },
                         );
+
+                        // known-future: out-of-flow boxes this stacking context paints for an outer
+                        // containing block escape its overflow clip (Chrome clips a box only by the
+                        // boxes on its containing-block chain), not its opacity or filter.
+                        if should_clip && adopts_oof {
+                            cx.draw_children_part(scene, cx.transform, clip_rect, Some(true));
+                        }
 
                         // Overlay scrollbars, drawn unscrolled above the
                         // clipped content.
@@ -1235,10 +1249,29 @@ impl ElementCx<'_, '_> {
         parent_style_transform: Affine,
         clip_rect: Rect,
     ) {
+        self.draw_children_part(scene, parent_style_transform, clip_rect, None)
+    }
+
+    /// `adopted`: `None` draws every child; `Some(x)` only those whose `Node::is_adopted_by(this
+    /// node)` is `x` (known-future, see `Node::adopts_oof`).
+    fn draw_children_part(
+        &self,
+        scene: &mut impl PaintScene,
+        parent_style_transform: Affine,
+        clip_rect: Rect,
+        adopted: Option<bool>,
+    ) {
+        let tree = self.context.dom.as_ref().tree();
+        let keep = |id: NodeId| {
+            adopted.is_none_or(|x| tree.get(id).is_some_and(|n| n.is_adopted_by(self.node.id)) == x)
+        };
         // Negative z_index hoisted nodes
 
         if let Some(hoisted) = &self.node.stacking_context {
             for hoisted_child in hoisted.neg_z_hoisted_children() {
+                if !keep(hoisted_child.node_id) {
+                    continue;
+                }
                 let position = hoisted_child.position(self.node.tree(), self.node.id);
                 let pos = kurbo::Vec2 {
                     x: position.x as f64 * self.scale,
@@ -1256,6 +1289,9 @@ impl ElementCx<'_, '_> {
         // Regular children
         if let Some(children) = &*self.node.paint_children.borrow() {
             for child_id in children {
+                if !keep(*child_id) {
+                    continue;
+                }
                 // Fixed-position children of the root element are positioned against
                 // the viewport and do not scroll with it, so cancel out the viewport
                 // scroll (applied in `paint_scene`). A fixed box contained by a
@@ -1290,6 +1326,9 @@ impl ElementCx<'_, '_> {
         // Positive z_index hoisted nodes
         if let Some(hoisted) = &self.node.stacking_context {
             for hoisted_child in hoisted.pos_z_hoisted_children() {
+                if !keep(hoisted_child.node_id) {
+                    continue;
+                }
                 let position = hoisted_child.position(self.node.tree(), self.node.id);
                 let pos = kurbo::Vec2 {
                     x: position.x as f64 * self.scale,
