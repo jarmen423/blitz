@@ -29,7 +29,7 @@ members = [
     "examples/wgpu_texture",
     "examples/wasm_hello",
 ]
-exclude = ["sites"]
+exclude = ["sites", "patches"]
 resolver = "2"
 
 [workspace.package]
@@ -332,3 +332,7 @@ wgpu_context = { workspace = true }
 # [patch."https://github.com/linebender/parley"]
 # parley = { path = "../parley/parley" }
 # fontique = { path = "../parley/fontique" }
+
+# known-future: parley 0.13.0 with Blink's ascent/descent rule for geometricPrecision text (FSHOT_GEOMETRIC_PRECISION)
+[patch.crates-io]
+parley = { path = "patches/parley-0.13.0" }

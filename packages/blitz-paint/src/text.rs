@@ -289,6 +289,31 @@ pub(crate) fn glyph_runs<'a, 'b>(
     })
 }
 
+/// Whether glyph outlines are hinted. FSHOT_TEXT_HINT=0 turns hinting off, as Chrome does for
+/// `text-rendering: geometricPrecision` (which HyperFrames sets on every element); off by default
+/// under FSHOT_GEOMETRIC_PRECISION=1.
+fn text_hinting() -> bool {
+    static HINT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HINT.get_or_init(|| match std::env::var("FSHOT_TEXT_HINT").as_deref() {
+        Ok("0") | Ok("none") => false,
+        Ok("1") => true,
+        _ => !parley::geometric_precision(),
+    })
+}
+
+static GLYPH_RECTS: std::sync::Mutex<Option<Vec<Rect>>> = std::sync::Mutex::new(None);
+
+/// Start (or stop) recording the device-space box of every glyph run drawn, for a caller that needs to know
+/// where text landed (fshot's LCD text: where it landed on pixels that are not opaque it is drawn grayscale).
+pub fn record_glyph_rects(on: bool) {
+    *GLYPH_RECTS.lock().unwrap() = if on { Some(Vec::new()) } else { None };
+}
+
+/// The boxes recorded since the last call (recording stays on).
+pub fn take_glyph_rects() -> Vec<Rect> {
+    GLYPH_RECTS.lock().unwrap().as_mut().map(std::mem::take).unwrap_or_default()
+}
+
 /// Draw a glyph run's glyphs in a single colour.
 pub(crate) fn draw_glyph_run(
     scene: &mut impl PaintScene,
@@ -318,7 +343,7 @@ pub(crate) fn draw_glyph_run(
     scene.draw_glyphs(
         run.font(),
         font_size,
-        !FONT_EMBOLDEN_ENABLED,
+        !FONT_EMBOLDEN_ENABLED && text_hinting(),
         normalized_coords,
         embolden,
         Fill::NonZero,
@@ -333,6 +358,11 @@ pub(crate) fn draw_glyph_run(
         }),
         AntiAliasing::Enabled,
     );
+    if let Some(v) = GLYPH_RECTS.lock().unwrap().as_mut() {
+        let r = glyph_run_rect(glyph_run);
+        let r = Rect::new(r.x0 - font_size as f64 * 0.5, r.y0 - font_size as f64 * 0.25, r.x1 + font_size as f64 * 0.5, r.y1 + font_size as f64 * 0.25);
+        v.push(transform.transform_rect_bbox(r));
+    }
 }
 
 /// The layout-space box covered by a glyph run: its advance horizontally and the font's

@@ -70,6 +70,12 @@ fn selected_backend() -> Backend {
 struct SkiaOffscreen {
     surface_props: skia_safe::SurfaceProps,
     cache: SkiaSceneCache,
+    /// LCD text: Skia's raster pipeline draws it only into N32 (BGRA here) surfaces, so paint BGRA and swap back.
+    lcd: bool,
+    /// The same props without a pixel geometry (grayscale text), for the second paint of pictures whose text
+    /// landed on pixels that are not opaque: Skia's LCD there is worse than grayscale (docs/FIDELITY.md in
+    /// known-future), and Chrome draws such text grayscale too.
+    gray_props: skia_safe::SurfaceProps,
 }
 
 impl SkiaOffscreen {
@@ -79,22 +85,32 @@ impl SkiaOffscreen {
         skia_safe::graphics::set_resource_cache_total_bytes_limit(256 * 1024 * 1024);
         let dflt = skia_safe::SurfaceProps::default();
         // Match Chromium's Linux Skia text contrast (0.2) and gamma (1.2), same as anyrender_skia::surface_props().
+        // FSHOT_LCD=rgb|bgr: LCD (sub-pixel) text, which Chrome draws on opaque layers (the real HyperFrames render
+        // draws every element into its root layer, so its text is LCD; docs/FIDELITY.md). Skia only uses it where
+        // the text is drawn axis-aligned outside an opacity layer.
+        let geometry = match std::env::var("FSHOT_LCD").as_deref() {
+            Ok("1") | Ok("rgb") => skia_safe::PixelGeometry::RGBH,
+            Ok("bgr") => skia_safe::PixelGeometry::BGRH,
+            _ => dflt.pixel_geometry(),
+        };
         let surface_props = skia_safe::SurfaceProps::new_with_text_properties(
             dflt.flags(),
-            dflt.pixel_geometry(),
+            geometry,
             0.2,
             1.2,
         );
         Self {
             surface_props,
             cache: SkiaSceneCache::new(),
+            lcd: geometry != dflt.pixel_geometry(),
+            gray_props: skia_safe::SurfaceProps::new_with_text_properties(dflt.flags(), dflt.pixel_geometry(), 0.2, 1.2),
         }
     }
 
     fn render(&mut self, document: &mut HtmlDocument, w: u32, h: u32, white: bool) -> Vec<u8> {
         let info = skia_safe::ImageInfo::new(
             (w as i32, h as i32),
-            skia_safe::ColorType::RGBA8888,
+            if self.lcd { skia_safe::ColorType::BGRA8888 } else { skia_safe::ColorType::RGBA8888 },
             skia_safe::AlphaType::Premul,
             None,
         );
@@ -112,10 +128,59 @@ impl SkiaOffscreen {
             } else {
                 skia_safe::Color::TRANSPARENT
             });
+            if self.lcd {
+                blitz_paint::record_glyph_rects(true);
+            }
             let mut painter = SkiaScenePainter::new(surface.canvas(), &mut self.cache);
             paint_scene(&mut painter, document.as_mut(), 1.0, w, h, 0, 0);
         }
+        if self.lcd {
+            let rects: Vec<(usize, usize, usize, usize)> = blitz_paint::take_glyph_rects()
+                .iter()
+                .filter_map(|r| {
+                    let (x0, y0) = (r.x0.floor().max(0.0) as usize, r.y0.floor().max(0.0) as usize);
+                    let (x1, y1) = ((r.x1.ceil().max(0.0) as usize).min(w as usize), (r.y1.ceil().max(0.0) as usize).min(h as usize));
+                    (x0 < x1 && y0 < y1).then_some((x0, y0, x1, y1))
+                })
+                .collect();
+            let row = (w as usize) * 4;
+            let not_opaque = rects.iter().any(|&(x0, y0, x1, y1)| {
+                (y0..y1).any(|y| buf[y * row + x0 * 4..y * row + x1 * 4].chunks_exact(4).any(|p| p[3] != 255))
+            });
+            if not_opaque {
+                // paint again with grayscale text, and use it inside the text boxes wherever it is not opaque
+                let gray_info = skia_safe::ImageInfo::new(
+                    (w as i32, h as i32),
+                    skia_safe::ColorType::BGRA8888,
+                    skia_safe::AlphaType::Premul,
+                    None,
+                );
+                let mut gray = vec![0u8; buf.len()];
+                {
+                    let mut surface = skia_safe::surfaces::wrap_pixels(&gray_info, &mut gray[..], Some(row), Some(&self.gray_props))
+                        .expect("skia wrap_pixels failed");
+                    surface.canvas().clear(if white { skia_safe::Color::WHITE } else { skia_safe::Color::TRANSPARENT });
+                    let mut painter = SkiaScenePainter::new(surface.canvas(), &mut self.cache);
+                    paint_scene(&mut painter, document.as_mut(), 1.0, w, h, 0, 0);
+                }
+                for &(x0, y0, x1, y1) in &rects {
+                    for y in y0..y1 {
+                        for x in x0..x1 {
+                            let i = y * row + x * 4;
+                            if gray[i + 3] != 255 {
+                                buf[i..i + 4].copy_from_slice(&gray[i..i + 4]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         self.cache.next_gen();
+        if self.lcd {
+            for px in buf.chunks_exact_mut(4) {
+                px.swap(0, 2);
+            }
+        }
         buf
     }
 }

@@ -1,0 +1,359 @@
+// Copyright 2025 the Parley Authors
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+
+use crate::IndentOptions;
+use crate::InlineBox;
+use crate::layout::data::LayoutData;
+use crate::layout::style_metrics::StyleMetrics;
+use crate::layout::{
+    ContentWidths, SpanMetrics, Style, alignment::Alignment, alignment::AlignmentOptions,
+    line::Line, line_break::BreakLines,
+};
+use crate::style::Brush;
+
+use core::cmp::Ordering;
+use core::fmt;
+
+/// Text layout.
+///
+/// The [`Debug`] implementation prints a compact summary by default.
+/// The alternate form (`{:#?}`) formats the full underlying data.
+///
+/// [`Debug`]: core::fmt::Debug
+#[derive(Clone)]
+pub struct Layout<B: Brush> {
+    pub(crate) data: LayoutData<B>,
+}
+
+impl<B: Brush> fmt::Debug for Layout<B> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if f.alternate() {
+            f.debug_struct("Layout").field("data", &self.data).finish()
+        } else {
+            f.debug_struct("Layout")
+                .field("text_len", &self.data.text_len)
+                .field("width", &self.data.width)
+                .field("height", &self.data.height)
+                .field("lines", &self.data.lines.len())
+                .field("runs", &self.data.runs.len())
+                .field("styles", &self.data.styles.len())
+                .finish_non_exhaustive()
+        }
+    }
+}
+
+impl<B: Brush> Layout<B> {
+    /// Creates an empty layout.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Clears the layout while retaining capacity.
+    ///
+    /// This clears underlying strong references to fonts, which would otherwise
+    /// prevent those fonts from being freed until dropping or reusing this layout.
+    pub fn clear(&mut self) {
+        self.data.clear();
+    }
+
+    /// Returns the scale factor provided when creating the layout.
+    pub fn scale(&self) -> f32 {
+        self.data.scale
+    }
+
+    /// Returns the style collection for the layout.
+    pub fn styles(&self) -> &[Style<B>] {
+        &self.data.styles
+    }
+
+    /// The inherent metrics of the root span (in CSS terms, that is the metrics of the
+    /// [root inline box](https://www.w3.org/TR/css-inline-3/#root-inline-box)).
+    ///
+    /// These are available once the layout is built, and will be `None` otherwise.
+    /// The metric values come from the first available font and font size resolved
+    /// from [`push_default`](crate::RangedBuilder::push_default).
+    ///
+    /// The motivating use case is placing bullet list markers - Blink uses the root
+    /// span's ascent and descent for their location and size.
+    pub fn root_span_metrics(&self) -> Option<SpanMetrics> {
+        self.data
+            .style_metrics
+            .first()
+            .map(StyleMetrics::span_metrics)
+    }
+
+    /// Returns the length of the source text, in bytes.
+    pub fn text_len(&self) -> usize {
+        self.data.text_len
+    }
+
+    /// Returns the alignment that was active when lines were most recently broken.
+    ///
+    /// This returns `None` if [`Layout::break_all_lines`] or [`Layout::break_lines`] have
+    /// not been called since the layout was last built or [cleared](Self::clear).
+    pub fn alignment(&self) -> Option<Alignment> {
+        self.data.alignment
+    }
+
+    /// The `max_advance` that was used to line break the `Layout`
+    pub fn layout_max_advance(&self) -> f32 {
+        self.data.layout_max_advance
+    }
+
+    /// Returns the computed width of the layout excluding the width of hanging whitespace.
+    pub fn width(&self) -> f32 {
+        self.data.width
+    }
+
+    /// Returns the computed width of the layout including the width of trailing whitespace.
+    pub fn full_width(&self) -> f32 {
+        self.data.full_width
+    }
+
+    /// Returns the y-offset of the baseline of the first line in the layout.
+    /// Returns `None` if the layout is empty.
+    pub fn first_baseline(&self) -> Option<f32> {
+        self.lines().next().map(|line| line.metrics().baseline)
+    }
+
+    /// Returns the y-offset of the baseline of the last line in the layout.
+    /// Returns `None` if the layout is empty.
+    pub fn last_baseline(&self) -> Option<f32> {
+        self.lines().next_back().map(|line| line.metrics().baseline)
+    }
+
+    /// Calculates the lower and upper bounds on the width of the layout. These
+    /// are recalculated every time this method is called.
+    ///
+    /// This method currently may not return the correct results for
+    /// mixed-direction text.
+    pub fn calculate_content_widths(&self) -> ContentWidths {
+        self.data.calculate_content_widths()
+    }
+
+    /// Returns the height of the layout.
+    pub fn height(&self) -> f32 {
+        self.data.height
+    }
+
+    /// Returns the number of lines in the layout.
+    pub fn len(&self) -> usize {
+        self.data.lines.len()
+    }
+
+    /// Returns `true` if the layout is empty.
+    pub fn is_empty(&self) -> bool {
+        self.data.lines.is_empty()
+    }
+
+    /// Returns the line at the specified index.
+    ///
+    /// Returns `None` if the index is out of bounds, i.e. if it's
+    /// not less than [`self.len()`](Self::len).
+    pub fn get(&self, index: usize) -> Option<Line<'_, B>> {
+        Some(Line {
+            index: index as u32,
+            layout: self,
+            data: self.data.lines.get(index)?,
+        })
+    }
+
+    /// Returns `true` if the dominant direction of the layout is right-to-left.
+    pub fn is_rtl(&self) -> bool {
+        self.data.base_level.is_rtl()
+    }
+
+    /// Iterator over inline boxes in text index order.
+    pub fn inline_boxes(&self) -> impl ExactSizeIterator<Item = &InlineBox> + '_ {
+        self.data.inline_boxes.iter().map(|b| &b.inline_box)
+    }
+
+    /// Edit the inline box at `index` in [`Self::inline_boxes`] with `edit`.
+    ///
+    /// The changes do not apply to line breaks and line metrics until the layout is (re-)broken.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index` is out of bounds, or if `edit` changes [`InlineBox::index`] or whether the
+    /// box is [`crate::InlineBoxKind::InFlow`].
+    pub fn edit_inline_box(&mut self, index: usize, edit: impl FnOnce(&mut InlineBox)) {
+        let layout_box = &mut self.data.inline_boxes[index];
+        let (text_index, is_inline_object) =
+            (layout_box.inline_box.index, layout_box.is_inline_object());
+        edit(&mut layout_box.inline_box);
+        assert!(
+            layout_box.inline_box.index == text_index
+                && layout_box.is_inline_object() == is_inline_object,
+            "an inline box's index and whether it is in-flow is not allowed to change"
+        );
+        if is_inline_object {
+            self.data.place_inline_object(index);
+        }
+    }
+
+    /// Returns the line containing `byte_index` and the x-coordinate of the primary caret there.
+    ///
+    /// The primary caret is where text in the paragraph's direction would be inserted. Where the
+    /// text direction changes, this would be the position of a bidi neutral.
+    ///
+    /// This can be useful to, e.g., anchor things to the text that don't take part in layout.
+    ///
+    /// Returns `None` if the layout hasn't been broken into lines. See [`Self::break_lines`] and
+    /// [`Self::break_all_lines`].
+    pub fn primary_caret(&self, byte_index: usize) -> Option<(Line<'_, B>, f32)> {
+        let byte_index = byte_index.min(self.data.text_len);
+
+        // The last line starting at or before `byte_index`.
+        let index = self
+            .data
+            .lines
+            .partition_point(|line| line.text_range.start <= byte_index);
+        let line = self.get(index.checked_sub(1)?)?;
+
+        let cluster_at = |byte_index| {
+            line.runs()
+                .find_map(|run| run.cluster_at_text_byte(byte_index))
+        };
+        let before = byte_index.checked_sub(1).and_then(cluster_at);
+        let after = cluster_at(byte_index);
+        let [before_level, after_level] = [before, after]
+            .map(|cluster| cluster.map_or(self.data.base_level, |c| c.run.shaped.bidi_level));
+
+        // A bidi-neutral would take the lower of its neighbors' bidi levels, so it sits against
+        // that neighbor.
+        //
+        // We're either at the trailing edge of the character before, or the leading edge of the
+        // character after. Trailing is right in LTR, leading is left in LTR. Vice-versa for RTL.
+        let trailing = before_level <= after_level;
+        let neighbor = if trailing { before } else { after };
+        let x = match neighbor {
+            Some(cluster) => {
+                let right = trailing != cluster.is_rtl();
+                cluster.visual_offset()? + if right { cluster.advance() } else { 0. }
+            }
+            // If there's no neighbor, place the caret at the line's start edge if we're trailing,
+            // or end edge if we're leading.
+            None => {
+                let metrics = line.metrics();
+                let left = metrics.offset + metrics.inline_min_coord;
+                if trailing != self.is_rtl() {
+                    left
+                } else {
+                    left + line.runs().map(|run| run.advance()).sum::<f32>()
+                }
+            }
+        };
+        Some((line, x))
+    }
+
+    /// Returns an iterator over the lines in the layout.
+    pub fn lines(
+        &self,
+    ) -> impl ExactSizeIterator<Item = Line<'_, B>> + DoubleEndedIterator + '_ + Clone {
+        self.data
+            .lines
+            .iter()
+            .enumerate()
+            .map(move |(index, data)| Line {
+                index: index as u32,
+                layout: self,
+                data,
+            })
+    }
+
+    /// Sets the text-indent for the layout.
+    ///
+    /// The indent is applied as a margin on the start edge of indented lines, reducing the
+    /// available width for line breaking and offsetting content during alignment. Negative
+    /// values cause the line to protrude beyond the start edge.
+    ///
+    /// This must be called before [`Layout::break_all_lines`] or [`Layout::break_lines`].
+    /// The text indentation is reset to zero when the layout is [cleared](Self::clear) or built into.
+    pub fn set_text_indent(&mut self, amount: f32, options: IndentOptions) {
+        self.data.indent_amount = amount;
+        self.data.indent_options = options;
+    }
+
+    /// Set the alignment for the layout.
+    ///
+    /// This only takes effect the next time [`Layout::break_all_lines`] or [`Layout::break_lines`] is called.
+    /// The currently active value can be read as [`Self::alignment`].
+    ///
+    /// If a finite `max_advance` is supplied to `Layout::break_all_lines` then alignment will be applied
+    /// relative to that width. Otherwise alignment will be applied relative to the width of the
+    /// longest line as computed by line breaking.
+    ///
+    /// If line-specific `offset` and `max_advance` are set using the advanced methods on the `BreakLines`
+    /// struct then each line will be aligned individually within its line box.
+    ///
+    /// The alignment to be used is reset to [`Alignment::Start`] when the layout is [cleared](Self::clear) or built into.
+    pub fn set_alignment(&mut self, alignment: Alignment, options: AlignmentOptions) {
+        self.data.alignment_setting = alignment;
+        self.data.alignment_options = options;
+    }
+
+    /// Returns line breaker to compute lines for the layout.
+    // TODO: You must call [`BreakLines::finish`]?
+    pub fn break_lines(&mut self) -> BreakLines<'_, B> {
+        BreakLines::new(self)
+    }
+
+    /// Breaks all lines with the specified maximum advance.
+    pub fn break_all_lines(&mut self, max_advance: Option<f32>) {
+        self.break_lines()
+            .break_remaining(max_advance.unwrap_or(f32::MAX));
+    }
+
+    /// Returns the index and `Line` object for the line containing the
+    /// given byte `index` in the source text.
+    pub(crate) fn line_for_byte_index(&self, index: usize) -> Option<(usize, Line<'_, B>)> {
+        let line_index = self
+            .data
+            .lines
+            .binary_search_by(|line| {
+                if index < line.text_range.start {
+                    Ordering::Greater
+                } else if index >= line.text_range.end {
+                    Ordering::Less
+                } else {
+                    Ordering::Equal
+                }
+            })
+            .ok()?;
+        Some((line_index, self.get(line_index)?))
+    }
+
+    /// Returns the index and `Line` object for the line containing the
+    /// given `offset`.
+    ///
+    /// The offset is specified in the direction orthogonal to line direction.
+    /// For horizontal text, this is a vertical or y offset. If the offset is
+    /// on a line boundary, it is considered to be contained by the later line.
+    pub(crate) fn line_for_offset(&self, offset: f32) -> Option<(usize, Line<'_, B>)> {
+        if offset < 0.0 {
+            return Some((0, self.get(0)?));
+        }
+        let maybe_line_index = self.data.lines.binary_search_by(|line| {
+            if offset < line.metrics.block_min_coord {
+                Ordering::Greater
+            } else if offset >= line.metrics.block_max_coord {
+                Ordering::Less
+            } else {
+                Ordering::Equal
+            }
+        });
+        let line_index = match maybe_line_index {
+            Ok(index) => index,
+            Err(index) => index.saturating_sub(1),
+        };
+        Some((line_index, self.get(line_index)?))
+    }
+}
+
+impl<B: Brush> Default for Layout<B> {
+    fn default() -> Self {
+        Self {
+            data: LayoutData::default(),
+        }
+    }
+}

@@ -835,9 +835,20 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
     }
 }
 
+/// The sampling for `image-rendering: auto`: FSHOT_IMAGE_QUALITY=low|medium|high (default medium: bilinear from the
+/// nearest mip level in Skia; high: bilinear between mip levels).
+fn auto_image_quality() -> peniko::ImageQuality {
+    static Q: std::sync::OnceLock<peniko::ImageQuality> = std::sync::OnceLock::new();
+    *Q.get_or_init(|| match std::env::var("FSHOT_IMAGE_QUALITY").as_deref() {
+        Ok("low") => peniko::ImageQuality::Low,
+        Ok("high") => peniko::ImageQuality::High,
+        _ => peniko::ImageQuality::Medium,
+    })
+}
+
 fn to_image_quality(image_rendering: ImageRendering) -> peniko::ImageQuality {
     match image_rendering {
-        ImageRendering::Auto => peniko::ImageQuality::Medium,
+        ImageRendering::Auto => auto_image_quality(),
         ImageRendering::CrispEdges => peniko::ImageQuality::Low,
         ImageRendering::Pixelated => peniko::ImageQuality::Low,
     }

@@ -13,6 +13,7 @@ mod layers;
 mod render;
 mod sizing;
 mod text;
+pub use text::{record_glyph_rects, take_glyph_rects};
 mod text_decorations;
 
 use std::collections::HashMap;
