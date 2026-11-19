@@ -145,6 +145,12 @@ pub struct ElementData {
 #[derive(Debug, Clone)]
 pub struct LayoutData {
     pub cache: Cache,
+    /// known-future: the baselines of this box's recent size measurements (`RunMode::ComputeSize`),
+    /// keyed by the measured size. Taffy's cache keeps only the size of a measurement, so a cache
+    /// hit used to return no baselines: an inline-block measured again after a restyle then sat on
+    /// the baseline (its whole height above it) and made its line box, and so a flex-centred
+    /// paragraph, taller than a fresh layout does. See `LayoutPassState::cache_get`.
+    pub measure_baselines: [Option<(taffy::Size<f32>, taffy::Baselines)>; 4],
     pub unrounded_layout: Layout,
     pub final_layout: Layout,
     pub scroll_offset: crate::Point<f64>,
@@ -159,6 +165,7 @@ impl LayoutData {
     pub const fn new() -> Self {
         Self {
             cache: Cache::new(),
+            measure_baselines: [None; 4],
             unrounded_layout: Layout::new(),
             final_layout: Layout::new(),
             scroll_offset: crate::Point::ZERO,

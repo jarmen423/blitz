@@ -739,10 +739,21 @@ impl taffy::CacheTree for LayoutPassState<'_> {
         node_id: NodeId,
         inputs: &taffy::LayoutInput,
     ) -> Option<taffy::LayoutOutput> {
-        self.node_from_id(node_id)
-            .try_layout_data()?
-            .cache
-            .get(inputs)
+        let layout_data = self.node_from_id(node_id).try_layout_data()?;
+        let mut output = layout_data.cache.get(inputs)?;
+        // known-future: a measurement comes back from taffy's cache as a size only; give it back
+        // the baselines measured with that size (see `LayoutData::measure_baselines`).
+        if inputs.run_mode == RunMode::ComputeSize
+            && output.baselines.first.is_none() && output.baselines.last.is_none()
+            && let Some((_, baselines)) = layout_data
+                .measure_baselines
+                .iter()
+                .flatten()
+                .find(|(size, _)| *size == output.size)
+        {
+            output.baselines = *baselines;
+        }
+        Some(output)
     }
 
     #[inline]
@@ -752,9 +763,24 @@ impl taffy::CacheTree for LayoutPassState<'_> {
         inputs: &taffy::LayoutInput,
         layout_output: taffy::LayoutOutput,
     ) {
-        self.node_from_id_mut(node_id)
-            .cache_mut()
-            .store(inputs, layout_output);
+        let node = self.node_from_id_mut(node_id);
+        if inputs.run_mode == RunMode::ComputeSize
+            && (layout_output.baselines.first.is_some() || layout_output.baselines.last.is_some())
+        {
+            let entry = (layout_output.size, layout_output.baselines);
+            let data = node.layout_data_mut();
+            let slots = &mut data.measure_baselines;
+            let k = slots
+                .iter()
+                .position(|e| e.is_some_and(|(size, _)| size == entry.0))
+                .or_else(|| slots.iter().position(|e| e.is_none()))
+                .unwrap_or(0);
+            if k == 0 && slots[0].is_some_and(|(size, _)| size != entry.0) {
+                slots.rotate_right(1); // the oldest goes
+            }
+            slots[k] = Some(entry);
+        }
+        node.cache_mut().store(inputs, layout_output);
     }
 
     #[inline]
