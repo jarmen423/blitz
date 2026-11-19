@@ -3769,10 +3769,11 @@ mod change_tracking_tests {
 /// Chrome on Linux resolves the generic families through its own default font settings (Times New Roman, Arial,
 /// Monospace), which fontconfig maps to the Liberation fonts where they are installed; plain fontconfig generics give
 /// Noto or DejaVu instead. When the Liberation fonts are present, use them as Chrome does (serif, also for cursive and
-/// fantasy, sans-serif, monospace). BLITZ_CHROME_GENERICS=0 keeps fontconfig's choice.
+/// fantasy, sans-serif, monospace) with BLITZ_CHROME_GENERICS=1 (off by default: HyperFrames fetches the Google
+/// fonts a project names, so in its real render the generics are rarely reached; measured worse on fries without them).
 fn chrome_linux_generics(collection: &mut parley::fontique::Collection) {
     use parley::fontique::GenericFamily as G;
-    if !cfg!(target_os = "linux") || matches!(std::env::var("BLITZ_CHROME_GENERICS").as_deref(), Ok("0")) {
+    if !cfg!(target_os = "linux") || !matches!(std::env::var("BLITZ_CHROME_GENERICS").as_deref(), Ok("1")) {
         return;
     }
     for (generic, name) in [
