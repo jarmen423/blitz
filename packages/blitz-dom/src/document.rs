@@ -421,6 +421,7 @@ impl BaseDocument {
                 font_ctx
                     .collection
                     .register_fonts(Blob::new(Arc::new(crate::BULLET_FONT) as _), None);
+                chrome_linux_generics(&mut font_ctx.collection);
                 font_ctx
             });
         let font_ctx = Arc::new(Mutex::new(font_ctx));
@@ -3762,5 +3763,27 @@ mod change_tracking_tests {
         doc.clear_changes();
         doc.clear_focus();
         assert!(doc.has_changes());
+    }
+}
+
+/// Chrome on Linux resolves the generic families through its own default font settings (Times New Roman, Arial,
+/// Monospace), which fontconfig maps to the Liberation fonts where they are installed; plain fontconfig generics give
+/// Noto or DejaVu instead. When the Liberation fonts are present, use them as Chrome does (serif, also for cursive and
+/// fantasy, sans-serif, monospace). BLITZ_CHROME_GENERICS=0 keeps fontconfig's choice.
+fn chrome_linux_generics(collection: &mut parley::fontique::Collection) {
+    use parley::fontique::GenericFamily as G;
+    if !cfg!(target_os = "linux") || matches!(std::env::var("BLITZ_CHROME_GENERICS").as_deref(), Ok("0")) {
+        return;
+    }
+    for (generic, name) in [
+        (G::Serif, "Liberation Serif"),
+        (G::Cursive, "Liberation Serif"),
+        (G::Fantasy, "Liberation Serif"),
+        (G::SansSerif, "Liberation Sans"),
+        (G::Monospace, "Liberation Mono"),
+    ] {
+        if let Some(id) = collection.family_id(name) {
+            collection.set_generic_families(generic, std::iter::once(id));
+        }
     }
 }
