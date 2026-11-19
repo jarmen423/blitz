@@ -4,6 +4,8 @@
 //!   fshot paint in1.html:out1.png:W:H [...]                    lay out at 1920x1080, paint a W x H picture
 //!                                                              on a transparent background
 //!   fshot paintset base.html setjobs.txt                       load once, paint many pictures
+//! A page that holds `<meta name="fshot-viewport" content="WxH">` is laid out at W x H instead of 1920x1080 in
+//! every mode (its frame size: `vw`, `vh`, the root's percentage sizes and media queries depend on it).
 //!
 //! Rasteriser backends (default: Vello CPU):
 //!   FSHOT_BACKEND=vello-cpu     (default) anyrender_vello_cpu
@@ -394,9 +396,21 @@ fn unpremultiply(buf: &mut [u8]) {
     }
 }
 
+/// known-future: the size a page asks to be laid out at, `<meta name="fshot-viewport" content="WxH">` in its head
+/// (prepare writes it for a frame size other than 1920x1080).
+fn page_viewport(html: &str) -> Option<(u32, u32)> {
+    let head = &html[..html.find("</head>").unwrap_or(html.len())];
+    let tail = &head[head.find("name=\"fshot-viewport\"")?..];
+    let value = &tail[tail.find("content=\"")? + 9..];
+    let (w, h) = value[..value.find('"')?].split_once('x')?;
+    let (w, h) = (w.trim().parse().ok()?, h.trim().parse().ok()?);
+    (w > 0 && h > 0).then_some((w, h))
+}
+
 fn load(input: &str, vw: u32, vh: u32) -> HtmlDocument {
     let path = std::fs::canonicalize(input).unwrap();
     let html = std::fs::read_to_string(&path).unwrap();
+    let (vw, vh) = page_viewport(&html).unwrap_or((vw, vh));
     let url = html
         .find("<base href=\"")
         .map(|i| {
