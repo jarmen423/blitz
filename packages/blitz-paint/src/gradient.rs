@@ -94,7 +94,12 @@ fn linear_gradient(
 ) -> (peniko::Gradient, Option<Affine>) {
     let (direction, items, flags) = gradient;
 
-    let center = bounding_box.center();
+    // known-future (outside round 5): the gradient box is the tile (`rect`: the background positioning area, sized by
+    // background-size), so an angled gradient line is centred on it. It was centred on the element's border box,
+    // which put every tile of a `background-size` gradient out of phase by (box width / 2 - tile / 2) modulo the
+    // tile (launch-claude-paper's tartan, 120px tiles in a 1346px box: 13px), and moved a bordered box's by its border.
+    let _ = bounding_box;
+    let center = rect.center();
     let (start, end) = match direction {
         LineDirection::Angle(angle) => {
             let angle = -angle.radians64() + std::f64::consts::PI;
