@@ -578,6 +578,10 @@ pub(crate) fn style(
         strikethrough_offset: Default::default(),
         strikethrough_size: Default::default(),
         strikethrough_brush: Default::default(),
+        // known-future: an inline element's room in its line is set where its span is pushed
+        // (layout/inline/build.rs), not here: this style is also the root's
+        inline_start_room: 0.0,
+        inline_end_room: 0.0,
     }
 }
 

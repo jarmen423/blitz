@@ -279,3 +279,32 @@ macro_rules! qual_name {
         }
     };
 }
+
+/// known-future (outside round 4): the room an inline element's box takes in its line before its
+/// first character and after its last, in CSS px: its inline-start (left) margin, border and padding,
+/// and its inline-end (right) ones (CSS 2.1 8.6, 10.8). A percentage margin or padding, which refers to
+/// the containing block's width, and `auto` count as zero. Left to right.
+pub fn inline_room(style: &style::properties::ComputedValues) -> (f32, f32) {
+    let (ml, mr) = inline_margins(style);
+    let lp = |v: &style::values::computed::LengthPercentage| v.to_length().map(|l| l.px()).unwrap_or(0.0);
+    let p = style.get_padding();
+    let b = style.get_border();
+    let side = |st: style::values::computed::BorderStyle, w: &style::values::computed::BorderSideWidth| {
+        if st.none_or_hidden() { 0.0 } else { w.0.to_f32_px() }
+    };
+    (
+        ml + side(b.border_left_style, &b.border_left_width) + lp(&p.padding_left.0),
+        mr + side(b.border_right_style, &b.border_right_width) + lp(&p.padding_right.0),
+    )
+}
+
+/// known-future: an inline element's left and right margins in CSS px (`auto` and percentages: zero).
+pub fn inline_margins(style: &style::properties::ComputedValues) -> (f32, f32) {
+    use style::values::generics::length::GenericMargin;
+    let m = style.get_margin();
+    let mg = |v: &style::values::computed::Margin| match v {
+        GenericMargin::LengthPercentage(x) => x.to_length().map(|l| l.px()).unwrap_or(0.0),
+        _ => 0.0,
+    };
+    (mg(&m.margin_left), mg(&m.margin_right))
+}

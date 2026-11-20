@@ -189,6 +189,7 @@ pub(crate) fn shape_text<'a, B: Brush>(
         false,
         &mut layout.data.shaped_text,
     );
+    add_inline_room(styles, &mut layout.data.shaped_text);
 
     // Out-of-flow boxes are laid out as items of their own.
     let mut out_of_flow_box_iter = inline_boxes
@@ -466,4 +467,67 @@ fn any_font(query: &mut Query<'_>) -> Option<QueryFont> {
     );
 
     found
+}
+
+/// known-future (outside round 4): the room CSS gives an inline element's inline-start and inline-end
+/// margin, border and padding in its line (CSS 2.1 10.8 and 8.6: they take horizontal space where the
+/// element's first and last box fragments begin and end). Blink lays it out so; the shaped text had none,
+/// so a padded or bordered span's text sat where its neighbours did and its box was painted over them.
+/// Each span with room gives it to the shaped cluster of the first character of its text (before) and of
+/// the last (after), counting the characters of its descendant spans, so breaking, glyph positions and
+/// alignment see it. Left-to-right text only (a right-to-left run is left as it was). A layout with no
+/// such span is not touched.
+fn add_inline_room<B: Brush>(styles: &[ResolvedStyle<B>], shaped: &mut parley_engine::ShapedText) {
+    if !styles
+        .iter()
+        .any(|s| s.inline_start_room != 0. || s.inline_end_room != 0.)
+    {
+        return;
+    }
+    // the first and last character of each span with room (its own text and its descendants')
+    let mut first = alloc::vec![u32::MAX; styles.len()];
+    let mut last = alloc::vec![0u32; styles.len()];
+    for (ci, c) in shaped.characters().iter().enumerate() {
+        let mut s = usize::from(c.style_index);
+        loop {
+            let st = &styles[s];
+            if st.inline_start_room != 0. || st.inline_end_room != 0. {
+                first[s] = first[s].min(ci as u32);
+                last[s] = last[s].max(ci as u32);
+            }
+            let p = usize::from(st.parent);
+            if s == 0 || p >= s {
+                break;
+            }
+            s = p;
+        }
+    }
+    let mut room: alloc::vec::Vec<(u32, f32, f32)> = alloc::vec::Vec::new();
+    for (s, st) in styles.iter().enumerate() {
+        if first[s] == u32::MAX {
+            continue;
+        }
+        let clusters = shaped.shaped_clusters();
+        let at = |ch: u32| clusters.partition_point(|c| c.chars_range().end <= ch) as u32;
+        if st.inline_start_room != 0. {
+            room.push((at(first[s]), st.inline_start_room, 0.));
+        }
+        if st.inline_end_room != 0. {
+            room.push((at(last[s]), 0., st.inline_end_room));
+        }
+    }
+    let rtl: alloc::vec::Vec<(core::ops::Range<u32>, bool)> = shaped
+        .runs()
+        .iter()
+        .map(|r| (r.shaped_clusters_range.clone(), r.bidi_level.is_rtl()))
+        .collect();
+    for (ci, before, after) in room {
+        if (ci as usize) >= shaped.shaped_clusters().len() {
+            continue;
+        }
+        if rtl.iter().any(|(r, is_rtl)| *is_rtl && r.contains(&ci)) {
+            continue;
+        }
+        shaped.add_cluster_room(ci, before, after);
+    }
 }

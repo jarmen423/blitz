@@ -11,8 +11,10 @@
 //! broken are square; with `clone` every fragment has all four sides. Fragments are snapped to
 //! whole pixels, as Blink snaps box decorations, and painted line by line, outer boxes first.
 //!
-//! Blitz does not make room in the line for an inline box's padding, border or margin, so the
-//! horizontal padding and border are painted over what they would have pushed aside.
+//! Since outside round 4 (known-future) an inline box's inline-start and inline-end margin, border and
+//! padding take room in the line (the text layout adds it before the element's first character and
+//! after its last), so the first fragment's border box starts where that room does, after the room of
+//! any enclosing span that starts at the same character, and the last fragment's ends likewise.
 
 use super::ElementCx;
 use crate::color::{Color, ToColorColor as _};
@@ -232,6 +234,72 @@ impl<'dom, 'a> ElementCx<'dom, 'a> {
         // Outer boxes first on each line (a parent's style comes before its children's).
         frags.sort_by_key(|f| (f.line, f.deco));
 
+        // (outside round 4) Where each span's text begins and ends, as (line, x): the room the text
+        // layout gave an enclosing span that begins (ends) at the same place lies outside this one's box.
+        let mut first_at: Vec<(usize, f64)> = vec![(usize::MAX, f64::INFINITY); styles.len()];
+        let mut last_at: Vec<(usize, f64)> = vec![(0, f64::NEG_INFINITY); styles.len()];
+        for (li, line) in layout.lines().enumerate() {
+            for item in line.items() {
+                let PositionedLayoutItem::GlyphRun(run) = item else { continue };
+                let (x0, x1) = (run.offset() as f64, (run.offset() + run.advance()) as f64);
+                let mut s = run.style_index() as usize;
+                loop {
+                    if (li, x0) < first_at[s] {
+                        first_at[s] = (li, x0);
+                    }
+                    if (li, x1) > last_at[s] {
+                        last_at[s] = (li, x1);
+                    }
+                    let Some(sb) = layout.style_span_box(s) else { break };
+                    if s == 0 || sb.parent >= s {
+                        break;
+                    }
+                    s = sb.parent;
+                }
+            }
+        }
+        // the room each span took (the text layout gave it to inline elements' own spans only)
+        let room_of = |s: usize| -> (f64, f64) {
+            if s == 0 {
+                return (0.0, 0.0);
+            }
+            let id = styles[s].brush.id;
+            if id == root {
+                return (0.0, 0.0);
+            }
+            if let Some(sb) = layout.style_span_box(s) {
+                if styles.get(sb.parent).is_some_and(|p| p.brush.id == id) {
+                    return (0.0, 0.0); // a style change inside the same element
+                }
+            }
+            match doc.get_node(id).and_then(|n| n.primary_styles()) {
+                Some(st) => {
+                    let (a, b) = blitz_dom::util::inline_room(&st);
+                    (a as f64 * self.scale, b as f64 * self.scale)
+                }
+                None => (0.0, 0.0),
+            }
+        };
+        let close = |a: (usize, f64), b: (usize, f64)| a.0 == b.0 && (a.1 - b.1).abs() < 1e-3;
+        let outer_room = |s: usize| -> (f64, f64) {
+            let (mut before, mut after) = (0.0, 0.0);
+            let mut a = s;
+            while let Some(sb) = layout.style_span_box(a) {
+                if a == 0 || sb.parent >= a {
+                    break;
+                }
+                a = sb.parent;
+                let (rb, ra) = room_of(a);
+                if close(first_at[a], first_at[s]) {
+                    before += rb;
+                }
+                if close(last_at[a], last_at[s]) {
+                    after += ra;
+                }
+            }
+            (before, after)
+        };
+
         // 3. Paint each fragment as a box of its own.
         let scale = self.scale;
         let basis = (self.frame.content_box().width() / scale).max(0.0) as f32;
@@ -261,8 +329,20 @@ impl<'dom, 'a> ElementCx<'dom, 'a> {
             };
             let top = f.baseline - sb.metrics.ascent as f64 - pw.y0 - bw.y0;
             let bottom = f.baseline + sb.metrics.descent as f64 + pw.y1 + bw.y1;
-            let left = f.x0 - pw.x0 - bw.x0;
-            let right = f.x1 + pw.x1 + bw.x1;
+            // (outside round 4) the first fragment's border box begins after the room of the spans
+            // around it that begin at the same place, and its own margin; the last one's ends so too
+            let (margin_l, margin_r) = blitz_dom::util::inline_margins(st);
+            let (outer_before, outer_after) = outer_room(d.style_index);
+            let left = if f.line == d.first_line {
+                f.x0 + outer_before + margin_l as f64 * scale
+            } else {
+                f.x0 - pw.x0 - bw.x0
+            };
+            let right = if f.line == d.last_line {
+                f.x1 - outer_after - margin_r as f64 * scale
+            } else {
+                f.x1 + pw.x1 + bw.x1
+            };
             // Snap the edges to whole pixels of this element's space.
             let x0 = (left + origin.x).round() - origin.x;
             let y0 = (top + origin.y).round() - origin.y;

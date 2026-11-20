@@ -285,6 +285,10 @@ impl<B: Brush> TreeStyleBuilder<B> {
         for prop in properties {
             style.apply(prop);
         }
+        // (known-future: a modification span is a style change inside the same element, not an
+        // element of its own: the room of the element it is in is not taken again)
+        style.inline_start_room = 0.;
+        style.inline_end_room = 0.;
         self.push_style_span(style);
     }
 

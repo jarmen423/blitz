@@ -361,6 +361,12 @@ pub struct TextStyle<'family, 'settings, B: Brush> {
     pub white_space_collapse: WhiteSpaceCollapse,
     /// The character that collapsible whitespace collapses to.
     pub collapsed_space: CollapsedSpace,
+    /// known-future: room in the line before this span's first character (an inline element's
+    /// inline-start margin, border and padding), in layout units before scaling. Not inherited.
+    pub inline_start_room: f32,
+    /// known-future: room in the line after this span's last character (its inline-end margin,
+    /// border and padding). Not inherited.
+    pub inline_end_room: f32,
 }
 
 impl<B: Brush> Default for TextStyle<'static, 'static, B> {
@@ -393,6 +399,8 @@ impl<B: Brush> Default for TextStyle<'static, 'static, B> {
             text_wrap_mode: TextWrapMode::default(),
             white_space_collapse: WhiteSpaceCollapse::default(),
             collapsed_space: CollapsedSpace::default(),
+            inline_start_room: 0.0,
+            inline_end_room: 0.0,
         }
     }
 }

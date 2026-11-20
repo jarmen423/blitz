@@ -228,13 +228,20 @@ pub(crate) fn build_inline_layout_into(
                             text_transformer.word_break(builder);
                         } else {
                             // node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
-                            let style = node
+                            let mut style = node
                                 .primary_styles()
                                 .map(|s| stylo_to_parley::style(node.id, &s))
                                 .unwrap_or_else(|| parley::TextStyle {
                                     white_space_collapse: WhiteSpaceCollapse::Collapse,
                                     ..Default::default()
                                 });
+                            // known-future (outside round 4): its margin, border and padding take room
+                            // in the line before its first character and after its last, as in Blink
+                            if let Some(s) = node.primary_styles() {
+                                let (start, end) = crate::util::inline_room(&s);
+                                style.inline_start_room = start;
+                                style.inline_end_room = end;
+                            }
 
                             builder.push_style_span(style);
 

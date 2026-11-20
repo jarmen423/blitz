@@ -212,6 +212,8 @@ impl ResolveContext {
             text_wrap_mode: raw_style.text_wrap_mode,
             white_space_collapse: raw_style.white_space_collapse,
             collapsed_space: raw_style.collapsed_space,
+            inline_start_room: raw_style.inline_start_room * scale,
+            inline_end_room: raw_style.inline_end_room * scale,
         }
     }
 
@@ -454,6 +456,10 @@ pub(crate) struct ResolvedStyle<B: Brush> {
     pub(crate) white_space_collapse: WhiteSpaceCollapse,
     /// The character that collapsible whitespace collapses to.
     pub(crate) collapsed_space: CollapsedSpace,
+    /// known-future: room before the span's first character and after its last (see
+    /// `TextStyle::inline_start_room`), scaled. Not inherited.
+    pub(crate) inline_start_room: f32,
+    pub(crate) inline_end_room: f32,
 }
 
 impl<B: Brush> ResolvedStyle<B> {
