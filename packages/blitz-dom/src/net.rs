@@ -52,6 +52,9 @@ pub struct FontFaceOverrides {
     /// parses this as a range; we record the lower bound, which equals the
     /// upper bound in the common single-value case.
     pub weight: Option<f32>,
+    /// known-future (outside round 5): the upper bound of the `font-weight` range, when it is a range (`400 800`, as
+    /// for a variable font); the face is then matched and drawn by the whole range (patches/fontique-0.13.0)
+    pub weight_max: Option<f32>,
     /// `font-style` descriptor mapped to fontique's `FontStyle`.
     pub style: Option<parley::fontique::FontStyle>,
     /// `font-stretch` (`font-width`) descriptor as a single width. Like
@@ -429,7 +432,11 @@ pub(crate) fn fetch_font_face_rules<'a>(
                     weight: descriptor
                         .font_weight
                         .as_ref()
-                        .and_then(|range| range.0.compute().map(|w| w.value())),
+                        .and_then(|range| range.compute().map(|r| r.0.value())),
+                    weight_max: descriptor
+                        .font_weight
+                        .as_ref()
+                        .and_then(|range| range.compute().map(|r| r.1.value())),
                     style: descriptor.font_style.as_ref().map(stylo_to_fontique_style),
                     width: descriptor.font_width.as_ref().and_then(|range| {
                         range

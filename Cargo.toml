@@ -340,3 +340,5 @@ parley = { path = "patches/parley-0.13.0" }
 parley_engine = { path = "patches/parley_engine-0.13.0" }
 # known-future: stylo 0.24.0 parsing container query units (cqw, cqh, cqi, cqb, cqmin, cqmax) in Servo mode too
 stylo = { path = "patches/stylo-0.24.0" }
+# known-future (outside round 5): fontique 0.13.0 matching an @font-face font-weight range (400 800) by the whole range
+fontique = { path = "patches/fontique-0.13.0" }

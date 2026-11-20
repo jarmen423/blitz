@@ -1398,6 +1398,7 @@ impl BaseDocument {
                 let info_override = parley::fontique::FontInfoOverride {
                     family_name: overrides.family_name.as_deref(),
                     weight: weight_override,
+                    weight_max: overrides.weight_max.map(parley::fontique::FontWeight::new),
                     style: overrides.style,
                     width: overrides.width,
                     ..Default::default()
