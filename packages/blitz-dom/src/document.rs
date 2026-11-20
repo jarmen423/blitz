@@ -3792,9 +3792,6 @@ fn chrome_linux_generics(collection: &mut parley::fontique::Collection) {
         (G::Cursive, "Liberation Serif"),
         (G::Fantasy, "Liberation Serif"),
         (G::SansSerif, "Liberation Sans"),
-        // (outside round 5: Chrome headless on Linux draws system-ui in its sans-serif font too,
-        // tools/checks/pages/o5/symbol_fallback_chrome.html)
-        (G::SystemUi, "Liberation Sans"),
         (G::Monospace, "Liberation Mono"),
     ] {
         if let Some(id) = collection.family_id(name) {
@@ -3802,5 +3799,11 @@ fn chrome_linux_generics(collection: &mut parley::fontique::Collection) {
             // families, where Chrome's rule for faking bold applies)
             collection.set_generic_families_exclusive(generic, std::iter::once(id));
         }
+    }
+    // (outside round 5) Chrome draws system-ui in fontconfig's own choice for it (Noto Sans here, not its sans-serif
+    // font: tools/checks/pages/o5/system_ui.html), also one font with the rest by fallback
+    let first_system_ui = collection.generic_families(G::SystemUi).next();
+    if let Some(id) = first_system_ui {
+        collection.set_generic_families_exclusive(G::SystemUi, std::iter::once(id));
     }
 }
