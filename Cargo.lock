@@ -3492,6 +3492,7 @@ dependencies = [
  "pollster",
  "skia-safe",
  "stylo",
+ "stylo_traits",
  "tokio",
  "url",
  "vello_gpu",

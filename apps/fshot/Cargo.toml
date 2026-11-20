@@ -16,6 +16,7 @@ blitz-traits = { workspace = true }
 blitz-paint = { workspace = true, features = ["svg"] }
 blitz-net = { workspace = true }
 style = { workspace = true }
+style_traits = { workspace = true }
 peniko = { workspace = true }
 pollster = { workspace = true }
 png = { workspace = true }
