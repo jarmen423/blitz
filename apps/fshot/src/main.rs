@@ -18,6 +18,12 @@
 //!   FSHOT_LCD=rgb|bgr           LCD text where it lands on opaque pixels (default off: grayscale everywhere)
 //!   FSHOT_TEXT_HINT=0|1         override the hinting; FSHOT_IMAGE_QUALITY=low|medium|high for image-rendering:auto
 //! Pages are loaded from disk; their <base href> (which Blitz doesn't apply itself) becomes the base URL.
+//! What it fetches by itself (known-future, net round 1):
+//!   FSHOT_NET=local             (default) `file:` and `data:` addresses only; every other address a page names (http,
+//!                               https, ...) is refused, not fetched, and listed on stderr at the end of each page's load
+//!                               as one line `FSHOT-REFUSED ["<url>", ...]` (the renderer fetches what a page may have
+//!                               itself, by its rules, before the layout: known_future/weblocal.py)
+//!   FSHOT_NET=open              blitz-net as it was: anything, over http too, from any host (a developer's own pages only)
 use anyrender::{AntiAliasing, ImageRenderer, PaintScene as _, render_to_buffer};
 use anyrender_skia::{SkiaSceneCache, SkiaScenePainter};
 use anyrender_vello_cpu::VelloCpuImageRenderer;
@@ -33,6 +39,9 @@ use blitz_traits::shell::{ColorScheme, Viewport};
 use peniko::Fill;
 use peniko::kurbo::Rect;
 use style::values::computed::CSSPixelLength;
+use blitz_traits::net::{Bytes, NetHandler, NetProvider, Request};
+use std::collections::HashSet;
+use std::sync::Mutex;
 use std::{fmt::Write as _, fs::File, io::BufWriter, sync::Arc, time::Instant};
 use vello_gpu::{
     RenderOptions, RenderSize, RenderTarget, RenderTargetConfig, Renderer as VelloHybridRenderer,
@@ -417,6 +426,83 @@ fn page_wants_chrome_generics(html: &str) -> bool {
     head.contains("<meta name=\"fshot-generics\" content=\"chrome\">")
 }
 
+/// known-future: the layout engine's own fetching (FSHOT_NET, header). With `local` (the default) it serves `file:` and
+/// `data:` addresses through blitz-net and refuses every other one at once, without opening a connection: the handler
+/// is told the fetch failed (so a stylesheet or a font no longer holds the layout up) and the address is recorded.
+/// Every fetch that fails, refused or not, is recorded too, so the wait for pictures below does not wait 30 s for an
+/// <img> whose file will never come.
+struct FetchGuard {
+    inner: Arc<Provider>,
+    open: bool,
+    refused: Arc<Mutex<Vec<String>>>,
+    failed: Arc<Mutex<HashSet<String>>>,
+}
+
+impl FetchGuard {
+    fn from_env(inner: Arc<Provider>) -> Self {
+        let open = match std::env::var("FSHOT_NET").as_deref() {
+            Err(_) | Ok("") | Ok("local") => false,
+            Ok("open") => true,
+            Ok(other) => {
+                eprintln!("warning: FSHOT_NET={other:?} is not one of local, open: fetching only file: and data: addresses");
+                false
+            }
+        };
+        FetchGuard { inner, open, refused: Default::default(), failed: Default::default() }
+    }
+}
+
+struct WatchFailure {
+    inner: Box<dyn NetHandler>,
+    url: String,
+    failed: Arc<Mutex<HashSet<String>>>,
+}
+
+impl NetHandler for WatchFailure {
+    fn bytes(self: Box<Self>, resolved_url: String, bytes: Bytes) {
+        self.inner.bytes(resolved_url, bytes)
+    }
+    fn error(self: Box<Self>, url: String, error: String) {
+        self.failed.lock().unwrap().insert(self.url.clone());
+        self.inner.error(url, error)
+    }
+}
+
+impl NetProvider for FetchGuard {
+    fn fetch(&self, doc_id: usize, request: Request, handler: Box<dyn NetHandler>) {
+        let url = request.url.to_string();
+        if self.open || matches!(request.url.scheme(), "file" | "data") {
+            let watched = Box::new(WatchFailure { inner: handler, url, failed: Arc::clone(&self.failed) });
+            return self.inner.fetch(doc_id, request, watched);
+        }
+        {
+            let mut r = self.refused.lock().unwrap();
+            if !r.contains(&url) {
+                r.push(url.clone());
+            }
+        }
+        self.failed.lock().unwrap().insert(url.clone());
+        handler.error(url, "refused: the layout engine fetches nothing by itself (FSHOT_NET=local)".into());
+    }
+}
+
+fn json_string(s: &str) -> String {
+    let mut o = String::with_capacity(s.len() + 2);
+    o.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            c if (c as u32) < 0x20 || c == '\u{2028}' || c == '\u{2029}' => {
+                let _ = write!(o, "\\u{:04x}", c as u32);
+            }
+            c => o.push(c),
+        }
+    }
+    o.push('"');
+    o
+}
+
 fn load(input: &str, vw: u32, vh: u32) -> HtmlDocument {
     let path = std::fs::canonicalize(input).unwrap();
     let html = std::fs::read_to_string(&path).unwrap();
@@ -432,12 +518,14 @@ fn load(input: &str, vw: u32, vh: u32) -> HtmlDocument {
             r[..r.find('"').unwrap()].to_string()
         })
         .unwrap_or_else(|| url::Url::from_file_path(&path).unwrap().to_string());
+    let base = url::Url::parse(&url).ok();
     let net = Arc::new(Provider::new(None));
+    let guard = Arc::new(FetchGuard::from_env(Arc::clone(&net)));
     let mut document = HtmlDocument::from_html(
         &html,
         DocumentConfig {
             base_url: Some(url),
-            net_provider: Some(Arc::clone(&net) as _),
+            net_provider: Some(Arc::clone(&guard) as _),
             viewport: Some(Viewport::new(vw, vh, 1.0, ColorScheme::Light)),
             ..Default::default()
         },
@@ -450,10 +538,15 @@ fn load(input: &str, vw: u32, vh: u32) -> HtmlDocument {
     loop {
         document.resolve(0.0);
         let doc = document.as_ref();
+        let failed = guard.failed.lock().unwrap().clone();
         let waiting = doc.tree().iter().any(|(_, n)| {
             n.data.is_element_with_tag_name(&img)
                 && n.attr(src.clone()).is_some_and(|s| !s.is_empty())
                 && n.element_data().is_none_or(|e| e.image_data().is_none())
+                // (a picture whose fetch was refused or failed will not come: not waited for)
+                && !n.attr(src.clone()).is_some_and(|s| {
+                    base.as_ref().and_then(|b| b.join(s.trim()).ok()).is_some_and(|u| failed.contains(u.as_str()))
+                })
         });
         if net.is_empty() && !doc.has_pending_critical_resources() && !waiting {
             break;
@@ -465,6 +558,12 @@ fn load(input: &str, vw: u32, vh: u32) -> HtmlDocument {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     document.as_mut().resolve(0.0);
+    let refused = guard.refused.lock().unwrap();
+    if !refused.is_empty() {
+        let list: Vec<String> = refused.iter().map(|u| json_string(u)).collect();
+        eprintln!("FSHOT-REFUSED [{}]", list.join(","));
+    }
+    drop(refused);
     document
 }
 
