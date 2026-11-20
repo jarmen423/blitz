@@ -336,3 +336,5 @@ wgpu_context = { workspace = true }
 # known-future: parley 0.13.0 with Blink's ascent/descent rule for geometricPrecision text (FSHOT_GEOMETRIC_PRECISION)
 [patch.crates-io]
 parley = { path = "patches/parley-0.13.0" }
+# known-future: stylo 0.24.0 parsing container query units (cqw, cqh, cqi, cqb, cqmin, cqmax) in Servo mode too
+stylo = { path = "patches/stylo-0.24.0" }

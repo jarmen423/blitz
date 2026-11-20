@@ -6,6 +6,9 @@ pub(crate) fn init_stylo_prefs() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
         style_config::set_pref!("layout.css.flexbox-balance.enabled", true);
+        // known-future: container-type (container query units; the cq units themselves are
+        // parsed by the patched stylo in patches/stylo-0.24.0)
+        style_config::set_pref!("layout.css.container-queries.enabled", true);
         style_config::set_pref!("layout.css.background-clip.text.enabled", true);
         style_config::set_pref!("layout.css.webkit-text-fill-color.enabled", true);
         style_config::set_pref!("layout.css.columns.enabled", true);

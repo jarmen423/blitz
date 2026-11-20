@@ -109,6 +109,41 @@ impl BaseDocument {
         timer.record_time("layout");
         self.nodes.bump_geometry_generation();
 
+        // known-future: a size container whose laid-out content box differs from the size it
+        // answered stylo with restyles its subtree, and style and layout run again (at most twice
+        // more): container query units are then those of the laid-out container.
+        if self
+            .nodes
+            .has_size_queries
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && self.container_query_passes < 2
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let mut moved = Vec::new();
+            for (id, node) in self.nodes.iter() {
+                if !node.container_queried.load(Relaxed) {
+                    continue;
+                }
+                let l = node.final_layout();
+                let w = (l.size.width - l.padding.left - l.padding.right - l.border.left - l.border.right).max(0.0);
+                let h = (l.size.height - l.padding.top - l.padding.bottom - l.border.top - l.border.bottom).max(0.0);
+                let w_moved = node.container_query_size[0].swap(w.to_bits(), Relaxed) != w.to_bits();
+                let h_moved = node.container_query_size[1].swap(h.to_bits(), Relaxed) != h.to_bits();
+                if w_moved || h_moved {
+                    moved.push(id);
+                }
+            }
+            if !moved.is_empty() {
+                for id in moved {
+                    self.nodes[id].set_restyle_hint(style::invalidation::element::restyle_hints::RestyleHint::restyle_subtree());
+                }
+                self.container_query_passes += 1;
+                self.resolve(current_time_for_animations);
+                self.container_query_passes -= 1;
+                return;
+            }
+        }
+
         // Resolve transforms
         let resolve_all = self.flags.contains(DocumentFlags::RESOLVE_ALL_TRANSFORMS);
         self.flags.remove(DocumentFlags::RESOLVE_ALL_TRANSFORMS);

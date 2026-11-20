@@ -215,6 +215,9 @@ pub struct BaseDocument {
     /// every node is treated as damaged on every `resolve`, so the same damage
     /// pipeline reconstructs and relays out the whole tree.
     pub(crate) incremental_layout: bool,
+    /// known-future: how many extra style and layout passes this resolve is in for container
+    /// query sizes that moved (at most 2)
+    pub(crate) container_query_passes: u8,
     /// How deeply this document is nested within other documents
     /// (0 for a root document). Used to limit `<iframe>` nesting depth.
     pub(crate) subdocument_depth: usize,
@@ -477,6 +480,7 @@ impl BaseDocument {
             flags: DocumentFlags::empty(),
             style_threading: config.style_threading,
             incremental_layout: config.incremental.unwrap_or(true),
+            container_query_passes: 0,
             subdocument_depth: config.subdocument_depth,
             devtool_settings: DevtoolSettings::default(),
             url: base_url,

@@ -16,7 +16,7 @@ use std::cell::{Cell, RefCell};
 use std::fmt::Write;
 use std::ops::Deref;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use style::computed_values::flex_direction::T as FlexDirection;
 use style::computed_values::isolation::T as Isolation;
 use style::computed_values::overflow_x::T as Overflow;
@@ -135,6 +135,11 @@ pub struct Node {
     /// (half of each collapsed border, set by the table's layout); its own computed borders are not
     /// laid out or painted then.
     pub collapsed_cell_border: Cell<Option<taffy::Rect<f32>>>,
+    /// known-future: for a size container stylo asked about, the content-box width and height it
+    /// answered with (f32 bits; `u32::MAX` before its first layout, when stylo falls back to the
+    /// viewport), and whether stylo asked
+    pub container_query_size: [AtomicU32; 2],
+    pub container_queried: AtomicBool,
 
     // Flags
     pub flags: NodeFlags,
@@ -450,6 +455,8 @@ impl Node {
             sc_contribution_cache: RefCell::new(ThinVec::new()),
             adopts_oof: Cell::new(false),
             collapsed_cell_border: Cell::new(None),
+            container_query_size: [AtomicU32::new(u32::MAX), AtomicU32::new(u32::MAX)],
+            container_queried: AtomicBool::new(false),
 
             flags: NodeFlags::empty(),
             out_of_flow: AtomicBool::new(false),

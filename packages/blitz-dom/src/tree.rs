@@ -41,6 +41,9 @@ pub struct NodeTree {
     /// Scroll offset of the viewport (the root element scrolls the viewport,
     /// so its offset lives here rather than on the node).
     viewport_scroll: crate::Point<f64>,
+    /// known-future: stylo has asked a size container for its size (container query units), so
+    /// every resolve checks whether a container's laid-out size moved (`Node::container_query_size`)
+    pub(crate) has_size_queries: std::sync::atomic::AtomicBool,
 }
 
 impl NodeTree {
@@ -49,6 +52,7 @@ impl NodeTree {
             map: SlotMap::with_key(),
             geometry_generation: AtomicU64::new(1),
             viewport_scroll: crate::Point::ZERO,
+            has_size_queries: std::sync::atomic::AtomicBool::new(false),
         }
     }
 

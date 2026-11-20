@@ -719,8 +719,24 @@ impl<'a> TElement for BlitzNode<'a> {
         &self,
         _display: &style::values::specified::Display,
     ) -> euclid::default::Size2D<Option<app_units::Au>> {
-        // FIXME: Implement container queries. For now this effectively disables them without panicking.
-        Default::default()
+        // known-future: the content-box size of the container's last layout (container query units:
+        // an outside project sizes its cards in `cqw`). Before its first layout there is none and
+        // stylo falls back to the viewport; `BaseDocument::resolve` then restyles the container's
+        // subtree once its laid-out size is known (and whenever it moves).
+        let node = self.0;
+        node.container_queried.store(true, Ordering::Relaxed);
+        node.tree().has_size_queries.store(true, Ordering::Relaxed);
+        let (w, h) = (
+            node.container_query_size[0].load(Ordering::Relaxed),
+            node.container_query_size[1].load(Ordering::Relaxed),
+        );
+        if w == u32::MAX || h == u32::MAX {
+            return Default::default();
+        }
+        euclid::default::Size2D::new(
+            Some(app_units::Au::from_f32_px(f32::from_bits(w))),
+            Some(app_units::Au::from_f32_px(f32::from_bits(h))),
+        )
     }
 
     fn each_custom_state<F>(&self, _callback: F)
