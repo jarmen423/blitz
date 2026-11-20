@@ -32,6 +32,7 @@ use blitz_paint::paint_scene;
 use blitz_traits::shell::{ColorScheme, Viewport};
 use peniko::Fill;
 use peniko::kurbo::Rect;
+use style::values::computed::CSSPixelLength;
 use std::{fmt::Write as _, fs::File, io::BufWriter, sync::Arc, time::Instant};
 use vello_gpu::{
     RenderOptions, RenderSize, RenderTarget, RenderTargetConfig, Renderer as VelloHybridRenderer,
@@ -541,6 +542,58 @@ fn dump(input: &str, output: &str) {
         first = false;
         let part: String = part.chars().filter(|c| *c != '"' && *c != '\\' && !c.is_control()).collect();
         write!(out, "[{},\"{}\",[{},{},{},{}]]", i, part, bb[0], bb[1], bb[2], bb[3]).unwrap();
+    }
+    // known-future: each <video>'s computed object-fit and object-position (the renderer places the decoded frames
+    // itself), as [data-i, fit, [x px, x %, y px, y %]]: a position is px + % of (box - object). Only <video> elements
+    // are listed, so a page without one dumps as before.
+    out.push_str("],\"video\":[");
+    let mut first = true;
+    let video = LocalName::from("video");
+    for (_, node) in doc.tree().iter() {
+        let (Some(i), Some(el)) = (node.attr(di.clone()), node.element_data()) else {
+            continue;
+        };
+        if el.name.local != video {
+            continue;
+        }
+        let Some(st) = node.primary_styles() else {
+            continue;
+        };
+        let pos = st.get_position().object_position.clone();
+        let part = |lp: &style::values::computed::LengthPercentage| {
+            let z = lp.resolve(CSSPixelLength::new(0.0)).px();
+            (z, lp.resolve(CSSPixelLength::new(100.0)).px() - z)
+        };
+        let (hx, hp) = part(&pos.horizontal);
+        let (vy, vp) = part(&pos.vertical);
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        write!(out, "[{},\"{:?}\",[{},{},{},{}]]", i, st.get_position().object_fit, hx, hp, vy, vp).unwrap();
+    }
+    // known-future: elements marked data-kf-place (the timed children of a HyperFrames root composition, which HyperFrames'
+    // runtime positions and sizes when the film loads), as [data-i, position, content width, content height]; -1 for a
+    // box with display:none
+    out.push_str("],\"place\":[");
+    let mut first = true;
+    let place = LocalName::from("data-kf-place");
+    for (_, node) in doc.tree().iter() {
+        let (Some(i), Some(_)) = (node.attr(di.clone()), node.attr(place.clone())) else {
+            continue;
+        };
+        let Some(st) = node.primary_styles() else {
+            continue;
+        };
+        let l = node.final_layout();
+        let none = format!("{:?}", node.taffy_display()) == "None";
+        let cw = if none { -1.0 } else { l.size.width - l.padding.left - l.padding.right - l.border.left - l.border.right };
+        let ch = if none { -1.0 } else { l.size.height - l.padding.top - l.padding.bottom - l.border.top - l.border.bottom };
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        write!(out, "[{},\"{:?}\",{},{}]", i, st.get_box().position, cw, ch).unwrap();
     }
     out.push_str("],\"styles\":{");
     let mut first = true;
