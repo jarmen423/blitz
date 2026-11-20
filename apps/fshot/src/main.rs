@@ -739,7 +739,9 @@ fn dump(input: &str, output: &str) {
                 c => vec![c],
             }).collect()
         };
-        let (clip, transform, origin, display, translate, rotate, scale) = {
+        // (outside round 4) and its computed width and height, as CSS text: GSAP starts a width or height tween from
+        // the element's value (a bar grown from a stylesheet's `width: 0` was drawn whole from its first frame)
+        let (clip, transform, origin, display, translate, rotate, scale, width, height) = {
             use style_traits::ToCss;
             (
                 st.get_svg().clip_path.to_css_string(),
@@ -749,11 +751,13 @@ fn dump(input: &str, output: &str) {
                 st.get_box().translate.to_css_string(),
                 st.get_box().rotate.to_css_string(),
                 st.get_box().scale.to_css_string(),
+                st.get_position().width.to_css_string(),
+                st.get_position().height.to_css_string(),
             )
         };
         write!(
             out,
-            "[{},{},{},{},\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\"]",
+            "[{},{},{},{},\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\"]",
             i,
             rgba(current),
             rgba(st.get_background().background_color.resolve_to_absolute(&current)),
@@ -764,7 +768,9 @@ fn dump(input: &str, output: &str) {
             esc(display),
             esc(translate),
             esc(rotate),
-            esc(scale)
+            esc(scale),
+            esc(width),
+            esc(height)
         )
         .unwrap();
     }
