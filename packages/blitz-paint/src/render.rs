@@ -591,6 +591,15 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
 
         // Compute clip-path (if any) and wrap all rendering in a clip layer
         let clip_path_shape = cx.clip_path_shape();
+        // known-future (outside round 4, faults round 4's leftover): a clip-path with no area
+        // (`inset(50%)`, `inset(100% 0 0 0)`, any shape on a box of zero height) hides the element
+        // and everything it paints, as in Chrome; the layer manager took an empty clip for none
+        if clip_path_shape.as_ref().is_some_and(|shape| {
+            let bb = shape.bounding_box();
+            !(bb.width() > 1e-9 && bb.height() > 1e-9)
+        }) {
+            return;
+        }
         let has_clip_path = clip_path_shape.is_some();
         let default_clip = cx.frame.border_box_path();
         let mut clip_path_for_layer = clip_path_shape.unwrap_or(default_clip);

@@ -164,10 +164,28 @@ impl ElementCx<'_, '_> {
                 let y1 = oy + h - bottom;
 
                 if x1 <= x0 || y1 <= y0 {
-                    return None;
+                    // known-future (outside round 4): an inset with no area clips everything away, as in
+                    // Chrome (an empty path; render_element then draws nothing), not nothing at all
+                    return Some(BezPath::new());
                 }
 
-                // TODO: Support border-radius on inset()
+                // known-future (outside round 4): the `round` radii of inset(), as border-radius
+                // (each corner's horizontal radius, percentages of the inset rectangle's width),
+                // scaled down together where they would overlap
+                let (iw, ih) = (x1 - x0, y1 - y0);
+                let rad = |c: &style::values::generics::border::GenericBorderCornerRadius<
+                    style::values::generics::NonNegative<LengthPercentage>,
+                >| c.0.width.0.resolve(CSSPixelLength::new(iw as f32)).px() as f64;
+                let r = &inset_rect.round;
+                let (tl, tr, br, bl) = (rad(&r.top_left), rad(&r.top_right), rad(&r.bottom_right), rad(&r.bottom_left));
+                if tl > 0.0 || tr > 0.0 || br > 0.0 || bl > 0.0 {
+                    let f = [iw / (tl + tr).max(1e-9), iw / (bl + br).max(1e-9), ih / (tl + bl).max(1e-9), ih / (tr + br).max(1e-9)]
+                        .into_iter()
+                        .fold(1.0f64, f64::min);
+                    return Some(
+                        kurbo::RoundedRect::new(x0, y0, x1, y1, (tl * f, tr * f, br * f, bl * f)).into_path(0.1),
+                    );
+                }
                 Some(kurbo::Rect::new(x0, y0, x1, y1).into_path(0.1))
             }
             GenericBasicShape::PathOrShape(path_or_shape) => match path_or_shape {
