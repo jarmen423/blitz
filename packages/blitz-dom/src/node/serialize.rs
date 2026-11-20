@@ -123,6 +123,59 @@ fn resolve_vars(value: &str, node: &Node, depth: u8) -> String {
     out
 }
 
+/// known-future (outside round 4): the SVG painting properties a stylesheet gives an element of an inline `<svg>` that it
+/// does not set by its own attribute or style attribute, as declarations for usvg, which reads only this source. Chrome
+/// applies them: hf-ex-decision-tree hides its connectors with `.connector{stroke-dasharray:1000;stroke-dashoffset:1000}`,
+/// launch-spacex strokes its icons with a rule. A value is written where it is set, not where it is only inherited (the
+/// root `<svg>`'s where it is not the initial value), so usvg's own inheritance, presentation attributes included, still
+/// decides the rest.
+fn svg_rule_paint(node: &Node, el: &crate::node::ElementData, nesting: usize, current_color: Option<&str>) -> String {
+    use style::values::computed::{SVGLength, SVGPaint, SVGStrokeDashArray, SVGWidth};
+    let Some(st) = node.primary_styles() else {
+        return String::new();
+    };
+    let parent = if nesting == 0 {
+        None
+    } else {
+        node.parent.and_then(|p| node.tree()[p].primary_styles())
+    };
+    let own = st.get_inherited_svg();
+    let inline = el.attr(local_name!("style")).unwrap_or("").to_ascii_lowercase();
+    let in_inline = |name: &str| inline.split(';').any(|d| d.split(':').next().is_some_and(|k| k.trim() == name));
+    let has_attr = |name: &str| el.attrs().iter().any(|a| a.name.ns == ns!() && &*a.name.local == name);
+    let mut out = String::new();
+    let values: [(&str, String, String, Option<String>); 5] = [
+        ("fill", own.fill.to_css_string(), SVGPaint::BLACK.to_css_string(),
+            parent.as_ref().map(|p| p.get_inherited_svg().fill.to_css_string())),
+        ("stroke", own.stroke.to_css_string(), SVGPaint::default().to_css_string(),
+            parent.as_ref().map(|p| p.get_inherited_svg().stroke.to_css_string())),
+        ("stroke-width", own.stroke_width.to_css_string(), SVGWidth::one().to_css_string(),
+            parent.as_ref().map(|p| p.get_inherited_svg().stroke_width.to_css_string())),
+        ("stroke-dasharray", own.stroke_dasharray.to_css_string(), SVGStrokeDashArray::default().to_css_string(),
+            parent.as_ref().map(|p| p.get_inherited_svg().stroke_dasharray.to_css_string())),
+        ("stroke-dashoffset", own.stroke_dashoffset.to_css_string(), SVGLength::zero().to_css_string(),
+            parent.as_ref().map(|p| p.get_inherited_svg().stroke_dashoffset.to_css_string())),
+    ];
+    for (name, value, initial, from_parent) in values {
+        let set_here = match &from_parent {
+            Some(p) => *p != value,
+            None => value != initial,
+        };
+        if !set_here || has_attr(name) || in_inline(name) {
+            continue;
+        }
+        let value = match current_color {
+            Some(c) => value.replace("currentcolor", c),
+            None => value,
+        };
+        out.push_str(name);
+        out.push(':');
+        out.push_str(&value);
+        out.push(';');
+    }
+    out
+}
+
 /// Writes an attribute's serialized name, per the HTML fragment serialization algorithm
 fn write_attr_name(name: &QualName, writer: &mut String) {
     match name.ns {
@@ -270,6 +323,13 @@ impl Node {
                     writer.push('"');
                 }
 
+                // (outside round 4) the painting properties rules give this SVG element, for usvg
+                let rule_paint = if opts.resolve_current_color && data.name.ns == ns!(svg) {
+                    svg_rule_paint(self, data, nesting, current_color.as_deref())
+                } else {
+                    String::new()
+                };
+                let mut rule_paint_written = rule_paint.is_empty();
                 for attr in data.attrs() {
                     if opts.skip_root_transform
                         && nesting == 0
@@ -288,12 +348,24 @@ impl Node {
                         && attr.name.local == local_name!("style")
                         && attr.value.to_ascii_lowercase().contains("opacity")
                     {
-                        let kept = style_without_opacity(&attr.value);
+                        let mut kept = style_without_opacity(&attr.value);
+                        if !rule_paint_written {
+                            kept = format!("{};{}", kept.trim_end().trim_end_matches(';'), rule_paint);
+                            rule_paint_written = true;
+                        }
                         if !kept.trim().is_empty() {
                             writer.push_str(" style=\"");
                             encode_quoted_attribute_to_string(&kept, writer);
                             writer.push('"');
                         }
+                        continue;
+                    }
+                    if !rule_paint_written && attr.name.ns == ns!() && attr.name.local == local_name!("style") {
+                        let joined = format!("{};{}", attr.value.trim_end().trim_end_matches(';'), rule_paint);
+                        writer.push_str(" style=\"");
+                        encode_quoted_attribute_to_string(&joined, writer);
+                        writer.push('"');
+                        rule_paint_written = true;
                         continue;
                     }
                     writer.push(' ');
@@ -313,6 +385,11 @@ impl Node {
                     } else {
                         encode_quoted_attribute_to_string(attr_value, writer);
                     }
+                    writer.push('"');
+                }
+                if !rule_paint_written {
+                    writer.push_str(" style=\"");
+                    encode_quoted_attribute_to_string(&rule_paint, writer);
                     writer.push('"');
                 }
                 if !has_children {
