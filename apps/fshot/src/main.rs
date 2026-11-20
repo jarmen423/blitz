@@ -408,10 +408,23 @@ fn page_viewport(html: &str) -> Option<(u32, u32)> {
     (w > 0 && h > 0).then_some((w, h))
 }
 
+/// known-future: a page that holds `<meta name="fshot-generics" content="chrome">` in its head resolves the generic
+/// families as Chrome on Linux does (the Liberation fonts: blitz-dom's chrome_linux_generics, BLITZ_CHROME_GENERICS=1).
+/// prepare writes it into pages read in HyperFrames' forms, where a family the page names but HyperFrames gives no face
+/// falls back to them in Chrome (hf-test-chat's Montserrat, named only in a linked stylesheet).
+fn page_wants_chrome_generics(html: &str) -> bool {
+    let head = &html[..html.find("</head>").unwrap_or(html.len())];
+    head.contains("<meta name=\"fshot-generics\" content=\"chrome\">")
+}
+
 fn load(input: &str, vw: u32, vh: u32) -> HtmlDocument {
     let path = std::fs::canonicalize(input).unwrap();
     let html = std::fs::read_to_string(&path).unwrap();
     let (vw, vh) = page_viewport(&html).unwrap_or((vw, vh));
+    if page_wants_chrome_generics(&html) {
+        // (read when the document's font collection is made, below; fshot loads one page per process)
+        unsafe { std::env::set_var("BLITZ_CHROME_GENERICS", "1") };
+    }
     let url = html
         .find("<base href=\"")
         .map(|i| {
@@ -594,6 +607,38 @@ fn dump(input: &str, output: &str) {
         }
         first = false;
         write!(out, "[{},\"{:?}\",{},{}]", i, st.get_box().position, cw, ch).unwrap();
+    }
+    // known-future: the computed colours of elements marked data-kf-cs (a GSAP tween of color, backgroundColor or
+    // borderColor starts from them), as [data-i, color, background-color, border-top-color], each [r, g, b, a] 0-255
+    out.push_str("],\"cs\":[");
+    let mut first = true;
+    let cs_mark = LocalName::from("data-kf-cs");
+    for (_, node) in doc.tree().iter() {
+        let (Some(i), Some(_)) = (node.attr(di.clone()), node.attr(cs_mark.clone())) else {
+            continue;
+        };
+        let Some(st) = node.primary_styles() else {
+            continue;
+        };
+        let current = st.get_inherited_text().color;
+        let rgba = |c: style::color::AbsoluteColor| {
+            let c = c.to_color_space(style::color::ColorSpace::Srgb);
+            let q = |x: f32| (x.clamp(0.0, 1.0) * 255.0).round() as i32;
+            format!("[{},{},{},{}]", q(c.components.0), q(c.components.1), q(c.components.2), q(c.alpha))
+        };
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        write!(
+            out,
+            "[{},{},{},{}]",
+            i,
+            rgba(current),
+            rgba(st.get_background().background_color.resolve_to_absolute(&current)),
+            rgba(st.get_border().border_top_color.resolve_to_absolute(&current))
+        )
+        .unwrap();
     }
     out.push_str("],\"styles\":{");
     let mut first = true;
