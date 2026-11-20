@@ -31,6 +31,10 @@ pub static PAINT_LOG: std::sync::Mutex<Option<Vec<(NodeId, [f64; 6], f64, f64, [
 /// While PAINT_LOG is on: for each inline SVG, the screen bounds of what it actually draws (its content can
 /// overflow its box with overflow: visible).
 pub static SVG_LOG: std::sync::Mutex<Vec<(NodeId, [f64; 4])>> = std::sync::Mutex::new(Vec::new());
+/// known-future: while PAINT_LOG is on, for each part of an inline SVG that has an `id`, its object bounding box
+/// (usvg's `bounding_box`: in its own user space, what `getBBox()` gives), keyed by the `<svg>` node and the id.
+/// GSAP places an SVG part's `transformOrigin` against that box.
+pub static SVG_PARTS: std::sync::Mutex<Vec<(NodeId, String, [f64; 4])>> = std::sync::Mutex::new(Vec::new());
 
 const FONT_EMBOLDEN_ENABLED: bool = cfg!(any(
     feature = "font-embolden",

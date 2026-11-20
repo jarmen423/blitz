@@ -1411,6 +1411,19 @@ impl ElementCx<'_, '_> {
                 let r = transform.transform_rect_bbox(kurbo::Rect::new(b.left() as f64, b.top() as f64, b.right() as f64, b.bottom() as f64));
                 crate::SVG_LOG.lock().unwrap().push((self.node.id, [r.x0, r.y0, r.x1, r.y1]));
             }
+            fn parts(g: &anyrender_svg::usvg::Group, svg: NodeId, out: &mut Vec<(NodeId, String, [f64; 4])>) {
+                for node in g.children() {
+                    if !node.id().is_empty()
+                        && let Some(b) = node.bounding_box()
+                    {
+                        out.push((svg, node.id().to_string(), [b.left() as f64, b.top() as f64, b.right() as f64, b.bottom() as f64]));
+                    }
+                    if let anyrender_svg::usvg::Node::Group(child) = node {
+                        parts(child, svg, out);
+                    }
+                }
+            }
+            parts(svg.tree.root(), self.node.id, &mut crate::SVG_PARTS.lock().unwrap());
         }
 
         // An inline `<svg>`'s `transform` attribute is applied inside the tree, so its

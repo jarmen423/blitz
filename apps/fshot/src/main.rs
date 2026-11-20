@@ -487,6 +487,7 @@ fn dump(input: &str, output: &str) {
     let mut document = load(input, VW, VH);
     *blitz_paint::PAINT_LOG.lock().unwrap() = Some(Vec::new());
     blitz_paint::SVG_LOG.lock().unwrap().clear();
+    blitz_paint::SVG_PARTS.lock().unwrap().clear();
     let _ = render(&mut document, 64, 64, false);
     let log = blitz_paint::PAINT_LOG.lock().unwrap().take().unwrap();
     let svg_log = std::mem::take(&mut *blitz_paint::SVG_LOG.lock().unwrap());
@@ -526,6 +527,20 @@ fn dump(input: &str, output: &str) {
         }
         first = false;
         write!(out, "[{},[{},{},{},{}]]", i, bb[0], bb[1], bb[2], bb[3]).unwrap();
+    }
+    // known-future: the object bounding box of each SVG part with an id, as [svg's data-i, id, [x0, y0, x1, y1]]
+    out.push_str("],\"svgparts\":[");
+    let mut first = true;
+    for (id, part, bb) in std::mem::take(&mut *blitz_paint::SVG_PARTS.lock().unwrap()) {
+        let Some(i) = doc.get_node(id).and_then(|node| node.attr(di.clone())) else {
+            continue;
+        };
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        let part: String = part.chars().filter(|c| *c != '"' && *c != '\\' && !c.is_control()).collect();
+        write!(out, "[{},\"{}\",[{},{},{},{}]]", i, part, bb[0], bb[1], bb[2], bb[3]).unwrap();
     }
     out.push_str("],\"styles\":{");
     let mut first = true;
