@@ -659,7 +659,16 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                 let unscrolled_transform = cx.transform;
 
                 let border_box = cx.frame.border_box_path().bounding_box();
-                let filter = convert_filters(&effects.filter.0, border_box).map(Arc::new);
+                // known-future (outside round 3): the filter's region is what the box and its descendants paint (Filter
+                // Effects 1: an HTML element's filter region is its ink overflow), not the border box, unless the box clips
+                // its children: a child outside the box is filtered, not cut off (hf-ex-product-promo's browser frame, under
+                // a host with filter: blur(0px), was cut at the host's box)
+                let filter_region = if !should_clip || adopts_oof {
+                    Rect::new(-1.0e6, -1.0e6, 1.0e6, 1.0e6)
+                } else {
+                    border_box
+                };
+                let filter = convert_filters(&effects.filter.0, filter_region).map(Arc::new);
                 let backdrop_filter =
                     convert_filters(&effects.backdrop_filter.0, border_box).map(Arc::new);
 
@@ -684,6 +693,13 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                 // Local patch (fries fidelity test): an opacity-only layer on a box that doesn't clip its
                 // children must not clip them either (Chrome lets them overflow). Upstream TODO below.
                 if filter.is_none() && backdrop_filter.is_none() && (!should_clip || adopts_oof) {
+                    effect_layer_clip = Rect::new(-1.0e6, -1.0e6, 1.0e6, 1.0e6);
+                }
+                // known-future (outside round 3): nor may a `filter` layer: Chrome's filter region holds everything the
+                // box and its descendants paint (Filter Effects 1, the filter region of an HTML element: its ink overflow),
+                // so a child outside the box is filtered, not cut off (hf-ex-product-promo's browser frame, under a host
+                // with filter: blur(0px), was cut at the host's box). A backdrop-filter's region stays the border box.
+                if filter.is_some() && backdrop_filter.is_none() && (!should_clip || adopts_oof) {
                     effect_layer_clip = Rect::new(-1.0e6, -1.0e6, 1.0e6, 1.0e6);
                 }
 
