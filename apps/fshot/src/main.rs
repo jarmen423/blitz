@@ -1,9 +1,10 @@
-//! Headless Blitz for the known-future renderer test. Three modes:
+//! Headless Blitz for the known-future renderer test. Its modes:
 //!   fshot VW VH in1.html out1.png [in2.html out2.png ...]      full frames on white (fidelity test)
 //!   fshot dump in.html out.json                                layout, styles and paint order at 1920x1080
 //!   fshot paint in1.html:out1.png:W:H [...]                    lay out at 1920x1080, paint a W x H picture
 //!                                                              on a transparent background
 //!   fshot paintset base.html setjobs.txt                       load once, paint many pictures
+//!   fshot boxes in1.html out1.json [in2.html out2.json ...]    each element's CSSOM boxes (offsetWidth & co.), no paint
 //! A page that holds `<meta name="fshot-viewport" content="WxH">` is laid out at W x H instead of 1920x1080 in
 //! every mode (its frame size: `vw`, `vh`, the root's percentage sizes and media queries depend on it).
 //!
@@ -842,6 +843,130 @@ fn dump(input: &str, output: &str) {
     std::fs::write(output, out).unwrap();
 }
 
+/// known-future (outside round 6): `fshot boxes in1.html out1.json [in2.html out2.json ...]` lays each page out (no
+/// painting) and writes, for every element that has a `data-i`, the boxes CSSOM View's measurements are read from: the
+/// timeline reader answers a script's `offsetWidth`, `getBoundingClientRect()` & co. while the page builds from them
+/// (known_future/reader/measure.mjs). One record per element:
+///   [data-i, flags, [x, y, w, h], offsetParent, [offsetLeft, offsetTop, offsetWidth, offsetHeight],
+///    [clientLeft, clientTop, clientWidth, clientHeight], [scrollWidth, scrollHeight], [x0, y0, x1, y1],
+///    [padding l t r b], [border l t r b], [margin l t r b]]
+/// [x, y, w, h] is the border box before transforms, document-relative, as getClientBoundingRect has it (a non-atomic
+/// inline: the union of its line fragments); [x0, y0, x1, y1] its bounds under the CSS transforms of it and of its
+/// containing blocks (getBoundingClientRect); offsetParent the data-i of the offset parent, -1 for none, -2 for one
+/// without a data-i. The values are unrounded CSS px; the reader rounds them as Chrome does. Flags: 1 not rendered
+/// (display: none, on it or above it), 2 a non-atomic inline, 4 a CSS transform of its own, 8 box-sizing: border-box,
+/// 16 position: fixed. Pages are laid out one after another in one process at their own viewport size.
+fn boxes(pairs: &[String]) {
+    use peniko::kurbo::{Affine, Vec2};
+    let di = LocalName::from("data-i");
+    for pair in pairs.chunks(2) {
+        let (input, output) = (&pair[0], &pair[1]);
+        let document = load(input, VW, VH);
+        let doc = document.as_ref();
+        let index = |id: NodeId| -> Option<String> { doc.get_node(id).and_then(|n| n.attr(di.clone()).map(|s| s.to_string())) };
+        // the affine from the page origin to the node's border box: each containing block's position, scroll and CSS
+        // transform, as the painter applies them (blitz-paint's node_transform), with the unrounded layout
+        fn chain(doc: &blitz_dom::BaseDocument, id: NodeId, depth: u32) -> Affine {
+            let Some(node) = doc.get_node(id) else { return Affine::IDENTITY };
+            let l = node.unrounded_layout().location;
+            let own = node.transform().as_deref().copied().unwrap_or_default();
+            let local = Affine::translate(Vec2::new(l.x as f64, l.y as f64)) * own;
+            match node.containing_block() {
+                Some(p) if depth < 4096 => {
+                    let (sx, sy) = doc.get_node(p).map(|n| (n.scroll_offset().x, n.scroll_offset().y)).unwrap_or((0.0, 0.0));
+                    chain(doc, p, depth + 1) * Affine::translate(Vec2::new(-sx, -sy)) * local
+                }
+                _ => local,
+            }
+        }
+        let fin = |v: f64| if v.is_finite() { v } else { 0.0 };
+        let mut out = String::from("{\"boxes\":[");
+        let mut first = true;
+        for (id, node) in doc.tree().iter() {
+            let Some(i) = node.attr(di.clone()) else { continue };
+            let Some(st) = node.primary_styles() else { continue };
+            let mut flags = 0u32;
+            let mut p = Some(id);
+            while let Some(q) = p {
+                let Some(n) = doc.get_node(q) else { break };
+                if n.element_data().is_some() && format!("{:?}", n.taffy_display()) == "None" {
+                    flags |= 1;
+                    break;
+                }
+                p = n.parent;
+            }
+            let inline = node.is_non_atomic_inline();
+            if inline {
+                flags |= 2;
+            }
+            if node.transform().is_some() && !inline {
+                flags |= 4;
+            }
+            if format!("{:?}", st.get_position().box_sizing) == "BorderBox" {
+                flags |= 8;
+            }
+            if format!("{:?}", st.get_box().position) == "Fixed" {
+                flags |= 16;
+            }
+            let l = *node.unrounded_layout();
+            let (rect, bounds, off, op) = if flags & 1 != 0 {
+                ([0.0; 4], [0.0; 4], [0.0; 4], -1i64)
+            } else {
+                let r = doc.get_client_bounding_rect(id).unwrap_or(blitz_dom::BoundingRect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 });
+                let o = doc.offset_rect(id).unwrap_or(blitz_dom::BoundingRect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 });
+                let op = match node.offset_parent() {
+                    _ if flags & 16 != 0 => -1,
+                    Some(pn) => index(pn.id).and_then(|s| s.parse::<i64>().ok()).unwrap_or(-2),
+                    None => -1,
+                };
+                let b = if inline {
+                    // the fragments are relative to the inline root's border box, under its transforms
+                    match (node.inline_fragment_boxes(), node.inline_root_ancestor()) {
+                        (Some(fr), Some(root)) => {
+                            let m = chain(doc, root.id, 0);
+                            let mut u: Option<Rect> = None;
+                            for f in fr {
+                                let q = m.transform_rect_bbox(Rect::new(f.left as f64, f.top as f64, f.right as f64, f.bottom as f64));
+                                u = Some(u.map_or(q, |a| a.union(q)));
+                            }
+                            u.map_or([0.0; 4], |u| [u.x0, u.y0, u.x1, u.y1])
+                        }
+                        _ => [r.x, r.y, r.x + r.width, r.y + r.height],
+                    }
+                } else {
+                    let q = chain(doc, id, 0).transform_rect_bbox(Rect::new(0.0, 0.0, l.size.width as f64, l.size.height as f64));
+                    [q.x0, q.y0, q.x1, q.y1]
+                };
+                ([r.x, r.y, r.width, r.height], b, [o.x, o.y, o.width, o.height], op)
+            };
+            let none = flags & 1 != 0;
+            let z = |v: f32| if none { 0.0 } else { v as f64 };
+            if !first {
+                out.push(',');
+            }
+            first = false;
+            write!(
+                out,
+                "[{},{},[{},{},{},{}],{},[{},{},{},{}],[{},{},{},{}],[{},{}],[{},{},{},{}],[{},{},{},{}],[{},{},{},{}],[{},{},{},{}]]",
+                i, flags,
+                fin(rect[0]), fin(rect[1]), fin(rect[2]), fin(rect[3]),
+                op,
+                fin(off[0]), fin(off[1]), fin(off[2]), fin(off[3]),
+                z(l.border.left), z(l.border.top), if none || inline { 0.0 } else { node.client_width() as f64 }, if none || inline { 0.0 } else { node.client_height() as f64 },
+                if none || inline { 0.0 } else { node.scroll_width() as f64 }, if none || inline { 0.0 } else { node.scroll_height() as f64 },
+                fin(bounds[0]), fin(bounds[1]), fin(bounds[2]), fin(bounds[3]),
+                z(l.padding.left), z(l.padding.top), z(l.padding.right), z(l.padding.bottom),
+                z(l.border.left), z(l.border.top), z(l.border.right), z(l.border.bottom),
+                z(l.margin.left), z(l.margin.top), z(l.margin.right), z(l.margin.bottom)
+            )
+            .unwrap();
+        }
+        let vp = doc.viewport().window_size;
+        write!(out, "],\"vp\":[{},{}]}}", vp.0, vp.1).unwrap();
+        std::fs::write(output, out).unwrap();
+    }
+}
+
 /// Load one scene page once, then paint many pictures from it: per picture, swap the CSS inside
 /// <style id="fshot-pic"> and set a few attributes (SVG part poses), re-resolve, paint, restore.
 /// Job file: records separated by a line "\x1e"; each record is "OUT W H", then "@ <data-i> <attr> <value>"
@@ -981,6 +1106,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args[1].as_str() {
         "dump" => dump(&args[2], &args[3]),
+        "boxes" => boxes(&args[2..]),
         "paintset" => paintset(&args[2], &args[3]),
         "paint" => {
             let backend = selected_backend();
