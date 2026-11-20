@@ -110,6 +110,9 @@ impl<'a> Query<'a> {
                     .fallback_families(FallbackKey::new(Script::from_bytes(*b"Hani"), None))
                     .map(CachedFamily::new),
             );
+            // known-future (outside round 5): with Chrome's generics, the system's sans-serif families after them
+            let tail = self.collection.system_fallback_tail();
+            self.state.fallback_families.extend(tail.into_iter().map(CachedFamily::new));
             self.fallbacks = Some(key);
         }
     }
@@ -120,12 +123,16 @@ impl<'a> Query<'a> {
     /// Return [`QueryStatus::Stop`] to end iterating over the matching
     /// fonts or [`QueryStatus::Continue`] to continue iterating.
     pub fn matches_with<'q>(&'q mut self, mut f: impl FnMut(&'q QueryFont) -> QueryStatus) {
-        for family in self
+        let n_families = self.state.families.len();
+        for (k, family) in self
             .state
             .families
             .iter_mut()
             .chain(self.state.fallback_families.iter_mut())
+            .enumerate()
         {
+            // known-future (outside round 5): a fallback family's fonts are faked bold by Chrome's fallback rule
+            let fallback = k >= n_families;
             match &mut family.family {
                 Entry::Error => continue,
                 Entry::Ok(..) => {}
@@ -146,6 +153,7 @@ impl<'a> Query<'a> {
                 self.attributes,
                 &mut family.best,
                 self.source_cache,
+                fallback,
             );
             let mut yielded_default = false;
             for font in bucket {
@@ -164,6 +172,7 @@ impl<'a> Query<'a> {
                 self.attributes,
                 &mut family.default,
                 self.source_cache,
+                fallback,
             ) && f(font) == QueryStatus::Stop
             {
                 return;
@@ -265,6 +274,7 @@ fn load_bucket<'a>(
     attributes: Attributes,
     bucket: &'a mut Entry<SmallVec<[QueryFont; 1]>>,
     source_cache: &mut SourceCache,
+    fallback: bool,
 ) -> &'a [QueryFont] {
     match bucket {
         Entry::Error => &[],
@@ -290,10 +300,11 @@ fn load_bucket<'a>(
                     family: (family.id(), index),
                     blob: blob.clone(),
                     index: font_info.index(),
-                    synthesis: font_info.synthesis(
+                    synthesis: font_info.synthesis_with(
                         attributes.width,
                         attributes.style,
                         attributes.weight,
+                        fallback,
                     ),
                     charmap_index: font_info.charmap_index(),
                 });
@@ -315,6 +326,7 @@ fn load_font<'a>(
     attributes: Attributes,
     font: &'a mut Entry<QueryFont>,
     source_cache: &mut SourceCache,
+    fallback: bool,
 ) -> Option<&'a QueryFont> {
     match font {
         Entry::Error => None,
@@ -327,8 +339,12 @@ fn load_font<'a>(
             let font_info = family.fonts().get(family_index)?;
             let blob = font_info.load(Some(source_cache))?;
             let blob_index = font_info.index();
-            let synthesis =
-                font_info.synthesis(attributes.width, attributes.style, attributes.weight);
+            let synthesis = font_info.synthesis_with(
+                attributes.width,
+                attributes.style,
+                attributes.weight,
+                fallback,
+            );
             *status = Entry::Ok(QueryFont {
                 family: (family.id(), family_index),
                 blob,

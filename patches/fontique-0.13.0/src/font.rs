@@ -25,6 +25,8 @@ pub struct FontInfo {
     /// known-future (outside round 5): the upper end of an `@font-face` `font-weight` range (`400 800`), whose
     /// lower end is `weight`; None for a single weight
     weight_max: Option<FontWeight>,
+    /// known-future (outside round 5): registered from a CSS `@font-face` rule (FontInfoOverride::css_face)
+    css_face: bool,
     axes: AxisVec,
     attr_axes: u8,
     charmap_index: CharmapIndex,
@@ -96,8 +98,36 @@ impl FontInfo {
 
     /// Returns synthesis suggestions for this font with the given attributes.
     pub fn synthesis(&self, width: FontWidth, style: FontStyle, weight: FontWeight) -> Synthesis {
+        self.synthesis_with(width, style, weight, false)
+    }
+
+    /// known-future (outside round 5): [`Self::synthesis`] for a font that a query reached among its fallback
+    /// families (`fallback`), whose bold Chrome fakes by another rule than a named font's (below)
+    pub fn synthesis_with(
+        &self,
+        width: FontWidth,
+        style: FontStyle,
+        weight: FontWeight,
+        fallback: bool,
+    ) -> Synthesis {
         let mut synth = Synthesis::default();
         let mut len = 0_usize;
+        // known-future (outside round 5): Chrome's synthetic bold, measured (tools/checks/pages/o5/synthetic_bold.html):
+        // - a CSS @font-face face is faked bold when 600 or more is asked and its declared weight (the upper end of a
+        //   range) is under 600 (Blink CSSSegmentedFontFace), and is drawn at the asked weight clamped to its declared
+        //   weight or range (a variable face declared 400 asked at 700: wght 400, faked bold);
+        // - a font reached by fallback for a character no font of the stack holds is faked bold when 600 or more is
+        //   asked and it is not bold itself (under 700; Blink FontCache::PlatformFallbackFontForCharacter on Linux);
+        // - a font named directly keeps fontique's rule (more than its weight + 200), which is Chrome's too.
+        let asked = weight.value();
+        let css_hi = self.weight_max.unwrap_or(self.weight).value();
+        let fake_bold = if self.css_face {
+            Some(asked >= 600.0 && css_hi < 600.0)
+        } else if fallback && !self.has_weight_axis() {
+            Some(asked >= 600.0 && self.weight.value() < 700.0)
+        } else {
+            None
+        };
         // A variable font is shaped at its axis defaults unless we set the axes,
         // and those defaults don't need to match the font's declared attributes.
         //
@@ -118,16 +148,20 @@ impl FontInfo {
         }
         // known-future (outside round 5): a face declared with a weight range is drawn at the weight asked, clamped to
         // that range, as Chrome does (a single declared weight keeps fontique's behaviour)
-        let weight = match self.weight_max {
-            Some(hi) => FontWeight::new(weight.value().clamp(self.weight.value(), hi.value())),
-            None => weight,
+        let weight = match (self.weight_max, self.css_face) {
+            (Some(hi), _) => FontWeight::new(weight.value().clamp(self.weight.value(), hi.value())),
+            (None, true) => self.weight,
+            (None, false) => weight,
         };
         if let Some(weight_axis) = self.axes.iter().find(|axis| axis.tag == Tag::new(b"wght")) {
             if weight_axis.default != weight.value() {
                 synth.vars[len] = (Tag::new(b"wght"), weight.value());
                 len += 1;
             }
-        } else if weight.value() > self.weight_max.unwrap_or(self.weight).value() + 200.0 {
+        } else if fake_bold.is_none() && weight.value() > self.weight_max.unwrap_or(self.weight).value() + 200.0 {
+            synth.embolden = true;
+        }
+        if fake_bold == Some(true) {
             synth.embolden = true;
         }
         // A positive `slnt` slants counter-clockwise, whereas positive CSS obliques slant
@@ -268,6 +302,7 @@ impl FontInfo {
             style,
             weight,
             weight_max: None,
+            css_face: false,
             axes,
             attr_axes,
             charmap_index,
@@ -305,6 +340,7 @@ impl FontInfo {
         if let Some(hi) = info_override.weight_max {
             self.weight_max = (hi.value() > self.weight.value()).then_some(hi);
         }
+        self.css_face |= info_override.css_face;
         if let Some(axes) = info_override.axes {
             // This is O(n^2) but no font should have enough axes for that to
             // matter (read-fonts does the same thing)
@@ -507,6 +543,9 @@ pub struct FontInfoOverride<'a> {
     /// known-future (outside round 5): the upper end of an `@font-face` `font-weight` range whose lower end is
     /// `weight`: the face is matched by the whole range and drawn at the weight asked within it.
     pub weight_max: Option<FontWeight>,
+    /// known-future (outside round 5): the font comes from a CSS `@font-face` rule, whose weight Chrome draws and
+    /// fakes by the rule's descriptors (FontInfo::synthesis_with)
+    pub css_face: bool,
     /// Default values for the font's variation axes. Axes not included within
     /// the font will be ignored.
     pub axes: Option<&'a [(Tag, f32)]>,

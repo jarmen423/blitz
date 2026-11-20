@@ -159,6 +159,17 @@ impl Collection {
         self.inner.set_generic_families(generic, families);
     }
 
+    /// known-future (outside round 5): replaces the generic family's families with these alone: the system's are
+    /// not chained after them, so a character they lack goes through the query's fallback families (Chrome resolves
+    /// a generic family to one font and falls back from there)
+    pub fn set_generic_families_exclusive(
+        &mut self,
+        generic: GenericFamily,
+        families: impl Iterator<Item = FamilyId>,
+    ) {
+        self.inner.set_generic_families_exclusive(generic, families);
+    }
+
     /// Appends the set of family identifiers to the given generic family.
     pub fn append_generic_families(
         &mut self,
@@ -374,11 +385,14 @@ impl Inner {
         family: GenericFamily,
     ) -> impl Iterator<Item = FamilyId> + '_ + Clone {
         self.sync_shared();
+        // (known-future, outside round 5: a generic family made exclusive takes no system family after its own)
+        let exclusive = self.data.generic_families.is_exclusive(family);
         GenericFamilies {
             ours: self.data.generic_families.get(family).iter().copied(),
             system: self
                 .system
                 .as_ref()
+                .filter(|_| !exclusive)
                 .map(|sys| sys.generic_families.get(family).iter().copied()),
         }
     }
@@ -405,6 +419,43 @@ impl Inner {
         }
         #[cfg(not(feature = "std"))]
         self.data.generic_families.set(generic, families);
+    }
+
+    /// known-future (outside round 5): the system's sans-serif families when a generic family was made exclusive
+    /// (Chrome's generics), to follow the fallback families: what the generic font lacks is looked for there, in that
+    /// order, as before, but as a fallback
+    pub fn system_fallback_tail(&mut self) -> Vec<FamilyId> {
+        self.sync_shared();
+        if !self.data.generic_families.any_exclusive() {
+            return Vec::new();
+        }
+        self.system
+            .as_ref()
+            .map(|sys| sys.generic_families.get(GenericFamily::SansSerif).to_vec())
+            .unwrap_or_default()
+    }
+
+    /// known-future (outside round 5): see Collection::set_generic_families_exclusive
+    pub fn set_generic_families_exclusive(
+        &mut self,
+        generic: GenericFamily,
+        families: impl Iterator<Item = FamilyId>,
+    ) {
+        self.sync_shared();
+        #[cfg(feature = "std")]
+        if let Some(shared) = &self.shared {
+            shared
+                .data
+                .lock()
+                .unwrap()
+                .generic_families
+                .set_exclusive(generic, families);
+            shared.bump_version();
+        } else {
+            self.data.generic_families.set_exclusive(generic, families);
+        }
+        #[cfg(not(feature = "std"))]
+        self.data.generic_families.set_exclusive(generic, families);
     }
 
     /// Appends the set of family identifiers to the given generic family.

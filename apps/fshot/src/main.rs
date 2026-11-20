@@ -711,6 +711,41 @@ fn dump(input: &str, output: &str) {
     // borderColor starts from them), as [data-i, color, background-color, border-top-color, clip-path, transform,
     // transform-origin, display, translate, rotate, scale], each colour [r, g, b, a] 0-255, the rest as CSS text (a layer's own clip-path is drawn by the
     // compositor; GSAP starts from the transform)
+    // known-future (outside round 5): for elements marked data-kf-cq (a GSAP x or y given in container units, which
+    // GSAP keeps and Chrome resolves against the element's query container), the content box those units resolve
+    // against, as [data-i, width, height]: for the width the nearest ancestor with inline-size or size containment, for
+    // the height the nearest with size containment (stylo's ContainerSizeQuery), the viewport when there is none.
+    out.push_str("],\"cq\":[");
+    let mut first = true;
+    let cq_mark = LocalName::from("data-kf-cq");
+    let vp = doc.viewport().window_size;
+    for (_, node) in doc.tree().iter() {
+        let (Some(i), Some(_)) = (node.attr(di.clone()), node.attr(cq_mark.clone())) else {
+            continue;
+        };
+        let (mut w, mut h): (Option<f32>, Option<f32>) = (None, None);
+        let mut p = node.parent;
+        while let (Some(pid), true) = (p, w.is_none() || h.is_none()) {
+            let Some(pn) = doc.get_node(pid) else { break };
+            if let Some(st) = pn.primary_styles() {
+                use style::values::specified::box_::ContainerType;
+                let ct = st.get_box().container_type;
+                let l = pn.final_layout();
+                if w.is_none() && ct.intersects(ContainerType::INLINE_SIZE | ContainerType::SIZE) {
+                    w = Some(l.size.width - l.padding.left - l.padding.right - l.border.left - l.border.right);
+                }
+                if h.is_none() && ct.contains(ContainerType::SIZE) {
+                    h = Some(l.size.height - l.padding.top - l.padding.bottom - l.border.top - l.border.bottom);
+                }
+            }
+            p = pn.parent;
+        }
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        write!(out, "[{},{},{}]", i, w.unwrap_or(vp.0 as f32), h.unwrap_or(vp.1 as f32)).unwrap();
+    }
     out.push_str("],\"cs\":[");
     let mut first = true;
     let cs_mark = LocalName::from("data-kf-cs");

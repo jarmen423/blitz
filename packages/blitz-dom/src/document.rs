@@ -1399,6 +1399,8 @@ impl BaseDocument {
                     family_name: overrides.family_name.as_deref(),
                     weight: weight_override,
                     weight_max: overrides.weight_max.map(parley::fontique::FontWeight::new),
+                    // known-future (outside round 5): drawn and faked bold by its descriptors, as Chrome does
+                    css_face: true,
                     style: overrides.style,
                     width: overrides.width,
                     ..Default::default()
@@ -3790,10 +3792,15 @@ fn chrome_linux_generics(collection: &mut parley::fontique::Collection) {
         (G::Cursive, "Liberation Serif"),
         (G::Fantasy, "Liberation Serif"),
         (G::SansSerif, "Liberation Sans"),
+        // (outside round 5: Chrome headless on Linux draws system-ui in its sans-serif font too,
+        // tools/checks/pages/o5/symbol_fallback_chrome.html)
+        (G::SystemUi, "Liberation Sans"),
         (G::Monospace, "Liberation Mono"),
     ] {
         if let Some(id) = collection.family_id(name) {
-            collection.set_generic_families(generic, std::iter::once(id));
+            // (outside round 5: that font alone, as Chrome; a character it lacks goes through fontique's fallback
+            // families, where Chrome's rule for faking bold applies)
+            collection.set_generic_families_exclusive(generic, std::iter::once(id));
         }
     }
 }
