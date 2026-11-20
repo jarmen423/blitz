@@ -610,7 +610,7 @@ fn dump(input: &str, output: &str) {
     }
     // known-future: the computed colours of elements marked data-kf-cs (a GSAP tween of color, backgroundColor or
     // borderColor starts from them), as [data-i, color, background-color, border-top-color, clip-path, transform,
-    // transform-origin], each colour [r, g, b, a] 0-255, the rest as CSS text (a layer's own clip-path is drawn by the
+    // transform-origin, display], each colour [r, g, b, a] 0-255, the rest as CSS text (a layer's own clip-path is drawn by the
     // compositor; GSAP starts from the transform)
     out.push_str("],\"cs\":[");
     let mut first = true;
@@ -640,24 +640,26 @@ fn dump(input: &str, output: &str) {
                 c => vec![c],
             }).collect()
         };
-        let (clip, transform, origin) = {
+        let (clip, transform, origin, display) = {
             use style_traits::ToCss;
             (
                 st.get_svg().clip_path.to_css_string(),
                 st.get_box().transform.to_css_string(),
                 st.get_box().transform_origin.to_css_string(),
+                st.get_box().display.to_css_string(),
             )
         };
         write!(
             out,
-            "[{},{},{},{},\"{}\",\"{}\",\"{}\"]",
+            "[{},{},{},{},\"{}\",\"{}\",\"{}\",\"{}\"]",
             i,
             rgba(current),
             rgba(st.get_background().background_color.resolve_to_absolute(&current)),
             rgba(st.get_border().border_top_color.resolve_to_absolute(&current)),
             esc(clip),
             esc(transform),
-            esc(origin)
+            esc(origin),
+            esc(display)
         )
         .unwrap();
     }
