@@ -633,6 +633,16 @@ fn start_angle(bt_width: f64, br_width: f64, radii: Vec2) -> f64 {
     // slope of the border intersection split
     let w = bt_width / br_width;
     let x = radii.y / (w * radii.x);
+    // known-future (outside round 5): a corner where one of the two sides has no border. With no border on the
+    // first side (bt_width 0) k is infinite and the formula below gives inf/inf (NaN), so the edge with the border
+    // got an empty path and was not drawn at all (a `border-left` with a `border-radius`); its limit is pi/2, the
+    // whole corner going to the edge that has a border. With no border on either side there is nothing to split.
+    if x.is_infinite() {
+        return std::f64::consts::FRAC_PI_2;
+    }
+    if x.is_nan() {
+        return std::f64::consts::FRAC_PI_4;
+    }
 
     /*
     Any point on an ellipse is given by:
@@ -677,6 +687,16 @@ fn start_angle(bt_width: f64, br_width: f64, radii: Vec2) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// known-future (outside round 5): a corner with a border on one side only gives that side the whole corner,
+    /// not NaN (a `border-left` with a `border-radius` was not drawn)
+    #[test]
+    fn one_sided_corner_goes_to_the_side_with_the_border() {
+        let r = Vec2::new(19.0, 19.0);
+        assert_eq!(start_angle(0.0, 6.0, r), std::f64::consts::FRAC_PI_2);
+        assert_eq!(start_angle(6.0, 0.0, r), 0.0);
+        assert!(start_angle(0.0, 0.0, r).is_finite());
+    }
 
     /// `start_angle` must return the angle `t` at which the border colour split
     /// line crosses the corner ellipse, i.e. the solution of
