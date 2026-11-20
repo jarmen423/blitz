@@ -434,7 +434,24 @@ impl LayoutPassState<'_> {
                         SpecialElementData::Canvas(_)
                         | SpecialElementData::SubDocument(_)
                         | SpecialElementData::None => {
-                            tag_intrinsic_sizes(&element_data.name.local, attr_size)
+                            // known-future: a <video> whose page states the clip's size (data-kf-natural="WxH",
+                            // written by prepare from the file) has it as its natural size, as a browser has once
+                            // the clip's metadata is loaded (hf-test-style-9's `width:100%; height:auto` video)
+                            let natural = (*element_data.name.local == local_name!("video"))
+                                .then(|| element_data.attr(LocalName::from("data-kf-natural")))
+                                .flatten()
+                                .and_then(|v| {
+                                    let (w, h) = v.split_once('x')?;
+                                    Some((w.trim().parse::<f32>().ok()?, h.trim().parse::<f32>().ok()?))
+                                })
+                                .filter(|(w, h)| *w > 0.0 && *h > 0.0);
+                            match natural {
+                                Some((w, h)) => (
+                                    IntrinsicSizes { width: Some(w), height: Some(h), ratio: Some(w / h) },
+                                    DEFAULT_OBJECT_SIZE,
+                                ),
+                                None => tag_intrinsic_sizes(&element_data.name.local, attr_size),
+                            }
                         }
                         #[cfg(feature = "custom-widget")]
                         SpecialElementData::CustomWidget(widget_data) => {
