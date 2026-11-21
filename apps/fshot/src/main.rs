@@ -710,7 +710,7 @@ fn dump(input: &str, output: &str) {
     }
     // known-future: the computed colours of elements marked data-kf-cs (a GSAP tween of color, backgroundColor or
     // borderColor starts from them), as [data-i, color, background-color, border-top-color, clip-path, transform,
-    // transform-origin, display, translate, rotate, scale], each colour [r, g, b, a] 0-255, the rest as CSS text (a layer's own clip-path is drawn by the
+    // transform-origin, display, translate, rotate, scale, width, height, top, right, bottom, left], each colour [r, g, b, a] 0-255, the rest as CSS text (a layer's own clip-path is drawn by the
     // compositor; GSAP starts from the transform)
     // known-future (outside round 5): for elements marked data-kf-cq (a GSAP x or y given in container units, which
     // GSAP keeps and Chrome resolves against the element's query container), the content box those units resolve
@@ -777,7 +777,9 @@ fn dump(input: &str, output: &str) {
         };
         // (outside round 4) and its computed width and height, as CSS text: GSAP starts a width or height tween from
         // the element's value (a bar grown from a stylesheet's `width: 0` was drawn whole from its first frame)
-        let (clip, transform, origin, display, translate, rotate, scale, width, height) = {
+        // (outside round 7) and its computed top, right, bottom and left, as CSS text (a percentage stays one): GSAP starts
+        // a tween of them from the element's value (launch-claude-paper's composers, from top: 50% to 87%, jumped to 87%)
+        let (clip, transform, origin, display, translate, rotate, scale, width, height, top, right, bottom, left) = {
             use style_traits::ToCss;
             (
                 st.get_svg().clip_path.to_css_string(),
@@ -789,11 +791,15 @@ fn dump(input: &str, output: &str) {
                 st.get_box().scale.to_css_string(),
                 st.get_position().width.to_css_string(),
                 st.get_position().height.to_css_string(),
+                st.get_position().top.to_css_string(),
+                st.get_position().right.to_css_string(),
+                st.get_position().bottom.to_css_string(),
+                st.get_position().left.to_css_string(),
             )
         };
         write!(
             out,
-            "[{},{},{},{},\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\"]",
+            "[{},{},{},{},\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\"]",
             i,
             rgba(current),
             rgba(st.get_background().background_color.resolve_to_absolute(&current)),
@@ -806,7 +812,11 @@ fn dump(input: &str, output: &str) {
             esc(rotate),
             esc(scale),
             esc(width),
-            esc(height)
+            esc(height),
+            esc(top),
+            esc(right),
+            esc(bottom),
+            esc(left)
         )
         .unwrap();
     }
