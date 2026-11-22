@@ -1,10 +1,11 @@
 use crate::NodeTree;
-use crate::events::{DragMode, handle_dom_event};
+use crate::events::{DragMode, WheelGesture, handle_dom_event};
 use crate::layout::construct::ConstructionTask;
 use crate::layout::damage::ALL_DAMAGE;
 use crate::mutator::ViewportMut;
 use crate::net::{
-    Resource, ResourceHandler, ResourceLoadResponse, StylesheetHandler, StylesheetLoader,
+    ImageHandler, Resource, ResourceHandler, ResourceLoadResponse, StylesheetHandler,
+    StylesheetLoader,
 };
 use crate::node::{ImageData, NodeFlags, RasterImageData, SpecialElementData, Status, TextBrush};
 use crate::scrolling::ScrollAnimationState;
@@ -21,7 +22,8 @@ use crate::{
 };
 use bitflags::bitflags;
 use blitz_traits::devtools::DevtoolSettings;
-use blitz_traits::events::{DomEvent, HitResult, UiEvent};
+use blitz_traits::events::EventDispatchSource;
+use blitz_traits::events::{BlitzFocusEvent, DomEvent, DomEventData, HitResult, UiEvent};
 use blitz_traits::navigation::{DummyNavigationProvider, NavigationProvider};
 use blitz_traits::net::{AbortSignal, DummyNetProvider, NetProvider, Request};
 use blitz_traits::node_id::NodeId;
@@ -34,7 +36,7 @@ use selectors::matching::QuirksMode;
 use smallvec::SmallVec;
 use std::any::Any;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, Bound, HashMap, HashSet};
+use std::collections::{BTreeMap, Bound, HashMap, HashSet, VecDeque};
 use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
 use std::str::FromStr;
@@ -284,6 +286,11 @@ pub struct BaseDocument {
     pub(crate) scrollbar_activity: HashMap<NodeId, Instant>,
     /// Whether and what kind of scroll animation is currently in progress
     pub(crate) scroll_animation: ScrollAnimationState,
+    /// Events which have been generated but not yet dispatched. Drained by the
+    /// [`EventDriver`](crate::EventDriver).
+    pub(crate) pending_events: VecDeque<DomEvent>,
+    /// The trackpad scroll gesture under way, locked to its main axis
+    pub(crate) wheel_gesture: WheelGesture,
 
     /// Text selection state (for non-input text)
     pub(crate) text_selection: TextSelection,
@@ -523,6 +530,8 @@ impl BaseDocument {
             hovered_scrollbar: None,
             scrollbar_activity: HashMap::new(),
             scroll_animation: ScrollAnimationState::None,
+            pending_events: VecDeque::new(),
+            wheel_gesture: WheelGesture::default(),
             text_selection: TextSelection::default(),
             scratch: DocumentScratch::default(),
         };
@@ -624,6 +633,36 @@ impl BaseDocument {
         crate::net::stamped_request(url, self.abort_signal.as_ref())
     }
 
+    /// Fetch the image at `url` for `node_id`, unless it is already being fetched,
+    /// in which case `node_id` is queued for it. Callers check `image_cache` first.
+    pub(crate) fn fetch_image(&mut self, url: url::Url, node_id: NodeId, image_type: ImageType) {
+        let waiting = (node_id, image_type);
+        if let Some(waiting_list) = self.pending_images.get_mut(url.as_str()) {
+            #[cfg(feature = "tracing")]
+            tracing::info!("Image {url} already pending, queueing node {node_id}");
+            if !waiting_list.contains(&waiting) {
+                waiting_list.push(waiting);
+            }
+            return;
+        }
+
+        #[cfg(feature = "tracing")]
+        tracing::info!("Fetching image {url}");
+        self.pending_images
+            .insert(url.as_str().to_string(), vec![waiting]);
+        self.net_provider.fetch(
+            self.id(),
+            self.build_request(url),
+            ResourceHandler::boxed(
+                self.tx.clone(),
+                self.id(),
+                None, // Don't pass node_id, we'll handle it via pending_images
+                self.shell_provider.clone(),
+                ImageHandler::new(image_type),
+            ),
+        );
+    }
+
     pub fn favicon_url(&self) -> Option<String> {
         self.tree().iter().find_map(|(_, node)| {
             let data = &node.data;
@@ -658,12 +697,67 @@ impl BaseDocument {
         DocumentMutator::new(self)
     }
 
-    pub fn handle_dom_event<F: FnMut(DomEvent)>(
-        &mut self,
-        event: &mut DomEvent,
-        dispatch_event: F,
-    ) {
-        handle_dom_event(self, event, dispatch_event)
+    /// Run an event's default action. `default_prevented` says whether a handler prevented
+    /// it, in which case only state that must follow every event is updated.
+    ///
+    /// Events generated in the process (focus, input, click, ...) are queued with
+    /// [`queue_event`](Self::queue_event).
+    pub fn handle_dom_event(&mut self, event: &mut DomEvent, default_prevented: bool) {
+        handle_dom_event(self, event, default_prevented)
+    }
+
+    /// Queue an event to be dispatched by an [`EventDriver`](crate::EventDriver).
+    ///
+    /// Events are queued rather than dispatched so that anything with access to the
+    /// document (default actions, state changes such as
+    /// [`set_focus_to`](Self::set_focus_to), embedder code) can generate them without
+    /// access to a driver.
+    ///
+    /// A `scroll` event replaces a `scroll` event for the same target at the back of the
+    /// queue, so scrolling a node several times before the queue is drained dispatches
+    /// one event with the latest scroll position. Only the back of the queue is
+    /// considered, which keeps `scroll` events in order relative to other events.
+    pub fn queue_event(&mut self, event: DomEvent) {
+        if matches!(event.data, DomEventData::Scroll(_))
+            && let Some(last) = self.pending_events.back_mut()
+            && matches!(last.data, DomEventData::Scroll(_))
+            && last.target == event.target
+            && last.source == event.source
+        {
+            *last = event;
+            return;
+        }
+
+        // Bound the queue in case the embedder never drains it
+        const MAX_PENDING_EVENTS: usize = 1024;
+        if self.pending_events.len() >= MAX_PENDING_EVENTS {
+            self.pending_events.pop_front();
+        }
+        self.pending_events.push_back(event);
+    }
+
+    /// [Queue](Self::queue_event) an event generated by the engine itself
+    pub(crate) fn queue_ua_event(&mut self, target: NodeId, data: DomEventData) {
+        self.queue_event(DomEvent::new(target, data, EventDispatchSource::UserAgent));
+    }
+
+    /// Take the next queued event (see [`queue_event`](Self::queue_event)), discarding
+    /// events whose target node has been dropped since they were queued.
+    ///
+    /// A node that was only detached from the tree still exists and still gets its events,
+    /// as an event can be dispatched to a node that is not in the document.
+    pub fn pop_pending_event(&mut self) -> Option<DomEvent> {
+        loop {
+            let event = self.pending_events.pop_front()?;
+            if self.nodes.contains_key(event.target) {
+                return Some(event);
+            }
+        }
+    }
+
+    /// Whether there are queued events waiting to be dispatched
+    pub fn has_pending_events(&self) -> bool {
+        !self.pending_events.is_empty()
     }
 
     pub fn as_any_mut(&mut self) -> &mut dyn Any {
@@ -1723,7 +1817,7 @@ impl BaseDocument {
         Some(id)
     }
 
-    /// Clear the focussed node
+    /// Clear the focussed node, queueing blur and focusout events for it
     pub fn clear_focus(&mut self) {
         if let Some(id) = self.focus_node_id {
             let shell_provider = self.shell_provider.clone();
@@ -1738,12 +1832,18 @@ impl BaseDocument {
             self.focus_node_id = None;
             self.has_changes = true;
             self.shell_provider.request_redraw();
+
+            self.queue_ua_event(id, DomEventData::Blur(BlitzFocusEvent));
+            self.queue_ua_event(id, DomEventData::FocusOut(BlitzFocusEvent));
         }
     }
 
     pub fn set_mousedown_node_id(&mut self, node_id: Option<NodeId>) {
         self.mousedown_node_id = node_id.and_then(|id| self.nearest_non_anonymous_ancestor(id));
     }
+
+    /// Focus the given node, returning whether the focus changed. Queues blur and focusout
+    /// events for the previously focussed node and focus and focusin events for the new one.
     pub fn set_focus_to(&mut self, focus_node_id: NodeId) -> bool {
         let Some(focus_node_id) = self.nearest_non_anonymous_ancestor(focus_node_id) else {
             return false;
@@ -1762,7 +1862,8 @@ impl BaseDocument {
         let shell_provider = self.shell_provider.clone();
 
         // Remove focus from the old node
-        if let Some(id) = self.focus_node_id {
+        let old_focus_node_id = self.focus_node_id;
+        if let Some(id) = old_focus_node_id {
             self.snapshot_node_and(id, ElementState::FOCUS | ElementState::FOCUSRING, |node| {
                 node.blur(shell_provider.clone())
             });
@@ -1801,6 +1902,13 @@ impl BaseDocument {
         // moving it changes what is on screen. Nothing else asks for the
         // frame: a keyboard focus change touches no layout and no content.
         self.shell_provider.request_redraw();
+
+        if let Some(id) = old_focus_node_id {
+            self.queue_ua_event(id, DomEventData::Blur(BlitzFocusEvent));
+            self.queue_ua_event(id, DomEventData::FocusOut(BlitzFocusEvent));
+        }
+        self.queue_ua_event(focus_node_id, DomEventData::Focus(BlitzFocusEvent));
+        self.queue_ua_event(focus_node_id, DomEventData::FocusIn(BlitzFocusEvent));
 
         true
     }
@@ -2178,7 +2286,6 @@ impl BaseDocument {
         let viewport_units_changed =
             old_viewport_size != device.au_viewport_size() && device.used_viewport_size();
         self.restyle_for_device_change(viewport_units_changed);
-        self.scroll_viewport_by(0.0, 0.0); // Clamp scroll offset
 
         // Text is shaped at a specific scale factor, so cached inline layouts
         // must be invalidated when the scale changes, as must every node's
