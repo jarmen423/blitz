@@ -337,6 +337,11 @@ pub struct BaseDocument {
     /// Value is a list of (node_id, image_type) pairs waiting for the image.
     pub(crate) pending_images: HashMap<String, Vec<(NodeId, ImageType)>>,
 
+    /// known-future (wave 0): the files this document's inline `<svg>` elements asked for through the net
+    /// provider (what their `<image href>` names), by resolved address; see `crate::util::SvgSubresourceLoader`.
+    pub(crate) svg_subresource_cache:
+        Arc<std::sync::Mutex<HashMap<String, Option<Arc<Vec<u8>>>>>>,
+
     /// Nodes whose `background-image`/`mask-image` layers need flushing to
     /// dedicated storage on the node because their style changed (populated by
     /// the style traversal and by pseudo-element box construction).
@@ -513,6 +518,7 @@ impl BaseDocument {
             deferred_construction_nodes: Vec::new(),
             image_cache: HashMap::new(),
             pending_images: HashMap::new(),
+            svg_subresource_cache: Default::default(),
             pending_style_image_nodes: Vec::new(),
             pending_critical_resources: HashSet::new(),
             controls_to_form: HashMap::new(),
@@ -1138,6 +1144,17 @@ impl BaseDocument {
 
     pub(crate) fn resolve_url(&self, raw: &str) -> Option<url::Url> {
         self.url.resolve_relative(raw)
+    }
+
+    /// known-future (wave 0): what an inline `<svg>` of this document fetches its `<image>` files with
+    #[cfg(feature = "svg")]
+    pub(crate) fn svg_subresource_loader(&self) -> crate::util::SvgSubresourceLoader {
+        crate::util::SvgSubresourceLoader {
+            base_url: self.base_url().clone(),
+            net_provider: self.net_provider.clone(),
+            doc_id: self.id(),
+            cache: self.svg_subresource_cache.clone(),
+        }
     }
 
     pub fn print_tree(&self) {
@@ -3709,6 +3726,7 @@ mod font_face_override_tests {
                 blitz_traits::net::Bytes::from_static(crate::BULLET_FONT),
                 FontFaceOverrides {
                     family_name: Some(String::from(ALIAS)),
+                    weight_max: None,
                     weight: Some(800.0),
                     style: Some(parley::fontique::FontStyle::Italic),
                     width: None,

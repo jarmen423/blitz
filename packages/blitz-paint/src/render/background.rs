@@ -1,4 +1,5 @@
 use super::{ALMOST_OPAQUE, ElementCx, to_image_quality, to_peniko_image};
+use crate::blend::convert_blend_mode;
 use crate::color::{Color, ToColorColor};
 use crate::gradient::to_peniko_gradient;
 use anyrender::{AntiAliasing, NonUniformRoundedRect, PaintScene};
@@ -133,6 +134,31 @@ impl ElementCx<'_, '_> {
         let image_data = &self.element.background_images;
         let layer_count = bg_styles.background_image.0.len();
 
+        // known-future (wave 0): `background-blend-mode`. Each background layer blends with the layers of this
+        // element's background under it and with its background colour, and with nothing behind the element
+        // (Compositing 1, 9.2: the background acts as an isolated group). So when a layer that paints something
+        // has a mode other than `normal`, the whole background is drawn in a group of its own, and each layer goes
+        // into it with its mode. Every layer was drawn `normal`.
+        let layer_blend = |idx: usize| -> BlendMode {
+            convert_blend_mode(*get_cyclic(&bg_styles.background_blend_mode.0, idx))
+        };
+        let blends = (0..layer_count).any(|idx| {
+            layer_blend(idx) != BlendMode::default()
+                && !layer_paints_nothing(&ImageLayerStyles::from_background(
+                    bg_styles, image_data, idx,
+                ))
+        });
+        let blend_group_pushed = self.context.layer_manager.maybe_push_layer(
+            scene,
+            blends,
+            BlendMode::default(),
+            ALMOST_OPAQUE,
+            self.transform,
+            &self.frame.border_box_shape(),
+            None,
+            None,
+        );
+
         // The background color is clipped by the clip of the last layer in the list
         let last_clip = *get_cyclic(&bg_styles.background_clip.0, layer_count - 1);
         let background_clip: BoxModelBox = last_clip.into();
@@ -163,7 +189,13 @@ impl ElementCx<'_, '_> {
             self.context.layer_manager.maybe_with_layer(
                 scene,
                 true,
-                peniko::BlendMode::default(),
+                // (only inside the group: a layer the group could not be made for stays `normal`, so that it never
+                // blends with what is behind the element)
+                if blend_group_pushed {
+                    layer_blend(idx)
+                } else {
+                    BlendMode::default()
+                },
                 1.0,
                 self.transform,
                 &background_clip_path,
@@ -177,6 +209,9 @@ impl ElementCx<'_, '_> {
         if text_run {
             self.end_text_clip_group(scene);
         }
+        self.context
+            .layer_manager
+            .maybe_pop_layer(scene, blend_group_pushed);
     }
 
     /// Starts an isolated group for `background-clip: text` layers; layers drawn

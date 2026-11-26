@@ -5,18 +5,29 @@ pub(crate) use style::computed_values::filter::single_value::T as StyloFilter;
 use anyrender::filters::{Filter, FilterEffect};
 use kurbo::Rect;
 
-pub(crate) fn convert_filters(filters: &[StyloFilter], bounds: Rect) -> Option<Filter> {
+/// `current_color` is the element's computed `color`: a `drop-shadow()` with no colour of its own, or with
+/// `currentColor`, takes it (Filter Effects 1; known-future, wave 0: it was always black).
+pub(crate) fn convert_filters(
+    filters: &[StyloFilter],
+    bounds: Rect,
+    current_color: &AbsoluteColor,
+) -> Option<Filter> {
     if filters.is_empty() {
         return None;
     }
 
     Some(Filter::linear_list(
-        filters.iter().filter_map(convert_single_filter),
+        filters
+            .iter()
+            .filter_map(|filter| convert_single_filter(filter, current_color)),
         bounds,
     ))
 }
 
-pub(crate) fn convert_single_filter(filter: &StyloFilter) -> Option<FilterEffect> {
+pub(crate) fn convert_single_filter(
+    filter: &StyloFilter,
+    current_color: &AbsoluteColor,
+) -> Option<FilterEffect> {
     Some(match filter {
         StyloFilter::Blur(radius) => FilterEffect::blur(radius.px()),
         StyloFilter::Brightness(amount) => FilterEffect::brightness(amount.0),
@@ -31,10 +42,9 @@ pub(crate) fn convert_single_filter(filter: &StyloFilter) -> Option<FilterEffect
             shadow.horizontal.px(),
             shadow.vertical.px(),
             shadow.blur.px(),
-            // TODO: pass in correct currentColor
             shadow
                 .color
-                .resolve_to_absolute(&AbsoluteColor::BLACK)
+                .resolve_to_absolute(current_color)
                 .as_color_color(),
         ),
         StyloFilter::Url(_) => return None,

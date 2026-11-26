@@ -1,8 +1,10 @@
 use crate::color::{Color, ToColorColor};
-use color::DynamicColor;
+use color::{ColorSpaceTag, DynamicColor, HueDirection};
 use kurbo::{self, Affine, Point, Rect, Vec2};
 use peniko::{self, ColorStop, Gradient, LinearGradientPosition, SweepGradientPosition};
 use style::color::AbsoluteColor;
+use style::color::ColorSpace as StyloColorSpace;
+use style::color::mix::{ColorInterpolationMethod, HueInterpolationMethod};
 use style::{
     OwnedSlice,
     values::{
@@ -52,7 +54,7 @@ pub(crate) fn to_peniko_gradient(
     scale: f64,
     current_color: &AbsoluteColor,
 ) -> (peniko::Gradient, Option<Affine>) {
-    match gradient {
+    let (mut peniko_gradient, transform) = match gradient {
         // https://developer.mozilla.org/en-US/docs/Web/CSS/gradient/linear-gradient
         GenericGradient::Linear {
             direction,
@@ -82,7 +84,63 @@ pub(crate) fn to_peniko_gradient(
             flags,
             ..
         } => conic_gradient((angle, position, items, *flags), origin_rect, current_color),
-    }
+    };
+
+    // known-future (wave 0): the colour space the stops are interpolated in, and the way round the hue circle,
+    // are the gradient's own (CSS Images 4: `linear-gradient(in oklch longer hue, ...)`; when none is written, Stylo
+    // has already chosen oklab for a gradient with a stop in a modern colour syntax and srgb for the rest). Every
+    // gradient was interpolated in sRGB.
+    let method = match gradient {
+        GenericGradient::Linear {
+            color_interpolation_method,
+            ..
+        }
+        | GenericGradient::Radial {
+            color_interpolation_method,
+            ..
+        }
+        | GenericGradient::Conic {
+            color_interpolation_method,
+            ..
+        } => color_interpolation_method,
+    };
+    let (interpolation_cs, hue_direction) = to_peniko_interpolation(method);
+    peniko_gradient.interpolation_cs = interpolation_cs;
+    peniko_gradient.hue_direction = hue_direction;
+
+    (peniko_gradient, transform)
+}
+
+/// The `color` crate's names for a CSS `<color-interpolation-method>`.
+///
+/// The XYZ spaces and linear Display P3 have no tag of their own in the rasterisers; they are linear-light spaces,
+/// a linear map away from linear sRGB, so a straight line between two colours is the same line there (Chrome's
+/// gradients do the same for `in xyz`).
+fn to_peniko_interpolation(method: &ColorInterpolationMethod) -> (ColorSpaceTag, HueDirection) {
+    let cs = match method.space {
+        StyloColorSpace::Srgb => ColorSpaceTag::Srgb,
+        StyloColorSpace::Hsl => ColorSpaceTag::Hsl,
+        StyloColorSpace::Hwb => ColorSpaceTag::Hwb,
+        StyloColorSpace::Lab => ColorSpaceTag::Lab,
+        StyloColorSpace::Lch => ColorSpaceTag::Lch,
+        StyloColorSpace::Oklab => ColorSpaceTag::Oklab,
+        StyloColorSpace::Oklch => ColorSpaceTag::Oklch,
+        StyloColorSpace::DisplayP3 => ColorSpaceTag::DisplayP3,
+        StyloColorSpace::A98Rgb => ColorSpaceTag::A98Rgb,
+        StyloColorSpace::ProphotoRgb => ColorSpaceTag::ProphotoRgb,
+        StyloColorSpace::Rec2020 => ColorSpaceTag::Rec2020,
+        StyloColorSpace::SrgbLinear
+        | StyloColorSpace::DisplayP3Linear
+        | StyloColorSpace::XyzD50
+        | StyloColorSpace::XyzD65 => ColorSpaceTag::LinearSrgb,
+    };
+    let hue = match method.hue {
+        HueInterpolationMethod::Shorter | HueInterpolationMethod::Specified => HueDirection::Shorter,
+        HueInterpolationMethod::Longer => HueDirection::Longer,
+        HueInterpolationMethod::Increasing => HueDirection::Increasing,
+        HueInterpolationMethod::Decreasing => HueDirection::Decreasing,
+    };
+    (cs, hue)
 }
 
 fn linear_gradient(
@@ -522,6 +580,36 @@ fn get_translation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interpolation_method_is_the_gradients_own() {
+        let m = |space, hue| to_peniko_interpolation(&ColorInterpolationMethod { space, hue });
+        assert_eq!(
+            m(StyloColorSpace::Srgb, HueInterpolationMethod::Shorter),
+            (ColorSpaceTag::Srgb, HueDirection::Shorter)
+        );
+        assert_eq!(
+            m(StyloColorSpace::Oklch, HueInterpolationMethod::Longer),
+            (ColorSpaceTag::Oklch, HueDirection::Longer)
+        );
+        assert_eq!(
+            m(StyloColorSpace::Oklab, HueInterpolationMethod::Shorter).0,
+            ColorSpaceTag::Oklab
+        );
+        assert_eq!(
+            m(StyloColorSpace::Hsl, HueInterpolationMethod::Increasing),
+            (ColorSpaceTag::Hsl, HueDirection::Increasing)
+        );
+        assert_eq!(
+            m(StyloColorSpace::Hwb, HueInterpolationMethod::Decreasing),
+            (ColorSpaceTag::Hwb, HueDirection::Decreasing)
+        );
+        // linear-light spaces with no tag of their own interpolate as linear sRGB does
+        assert_eq!(
+            m(StyloColorSpace::XyzD65, HueInterpolationMethod::Shorter).0,
+            ColorSpaceTag::LinearSrgb
+        );
+    }
 
     #[test]
     fn gradient_percentage_overflow_is_clamped() {

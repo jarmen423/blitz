@@ -677,9 +677,13 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                 } else {
                     border_box
                 };
-                let filter = convert_filters(&effects.filter.0, filter_region).map(Arc::new);
+                // (wave 0) a drop-shadow() with no colour of its own takes the element's `color`
+                let current_color = styles.clone_color();
+                let filter =
+                    convert_filters(&effects.filter.0, filter_region, &current_color).map(Arc::new);
                 let backdrop_filter =
-                    convert_filters(&effects.backdrop_filter.0, border_box).map(Arc::new);
+                    convert_filters(&effects.backdrop_filter.0, border_box, &current_color)
+                        .map(Arc::new);
 
                 // Adjust effect layer clip by filter expansion area
                 //

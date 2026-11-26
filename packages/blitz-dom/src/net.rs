@@ -638,7 +638,9 @@ impl ImageHandler {
         #[cfg(feature = "svg")]
         let svg_err = {
             use crate::util::parse_svg_image;
-            match parse_svg_image(&bytes) {
+            // known-future (wave 0): an SVG that is a picture itself loads no file of its own, as in a browser
+            // (only `data:` addresses are drawn); see crate::util::parse_svg_image
+            match parse_svg_image(&bytes, None) {
                 Ok(svg) => return Ok(Resource::Svg(self.kind, svg)),
                 Err(e) => e.to_string(),
             }

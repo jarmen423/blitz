@@ -316,6 +316,29 @@ impl NetProvider for Provider {
             waker.wake(doc_id);
         });
     }
+
+    /// known-future (wave 0): `data:` and `file:` addresses, which need no connection, read at once (an SVG
+    /// `<image href>` is resolved while usvg builds the tree). Any other address has no synchronous path here.
+    fn fetch_sync(&self, _doc_id: usize, request: Request) -> Option<Result<(String, Bytes), String>> {
+        match request.url.scheme() {
+            "data" => Some(
+                DataUrl::process(request.url.as_str())
+                    .map_err(|e| format!("data url error: {e:?}"))
+                    .and_then(|d| d.decode_to_vec().map_err(|e| format!("data url base64 error: {e:?}")))
+                    .map(|(bytes, _)| (request.url.to_string(), Bytes::from(bytes))),
+            ),
+            #[cfg(not(target_arch = "wasm32"))]
+            "file" => Some(
+                request
+                    .url
+                    .to_file_path()
+                    .map_err(|()| "not a file path".to_string())
+                    .and_then(|path| std::fs::read(path).map_err(|e| format!("io error: {e}")))
+                    .map(|bytes| (request.url.to_string(), Bytes::from(bytes))),
+            ),
+            _ => None,
+        }
+    }
 }
 
 struct AbortFetch<F, T> {

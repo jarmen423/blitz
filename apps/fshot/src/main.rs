@@ -8,9 +8,12 @@
 //! A page that holds `<meta name="fshot-viewport" content="WxH">` is laid out at W x H instead of 1920x1080 in
 //! every mode (its frame size: `vw`, `vh`, the root's percentage sizes and media queries depend on it).
 //!
-//! Rasteriser backends (default: Vello CPU):
-//!   FSHOT_BACKEND=vello-cpu     (default) anyrender_vello_cpu
-//!   FSHOT_BACKEND=skia          (or FSHOT_SKIA=1) anyrender_skia (CPU raster surface, Premul -> straight RGBA)
+//! Rasteriser (known-future, wave 0: Skia, and only Skia unless a developer asks otherwise):
+//!   FSHOT_BACKEND=skia          (the default; or FSHOT_SKIA=1) anyrender_skia (CPU raster surface, Premul -> straight
+//!                               RGBA). Every mode paints with it, `dump`'s paint-order pass too.
+//!   Any other rasteriser is refused with exit status 2 and one line on stderr: the renderer's pictures, and its
+//!   checks against Chrome, are Skia's. For development and benchmarks, FSHOT_ALLOW_NON_SKIA=1 lets these through:
+//!   FSHOT_BACKEND=vello-cpu     anyrender_vello_cpu
 //!   FSHOT_BACKEND=vello-hybrid  (or FSHOT_HYBRID=1) anyrender_vello_hybrid (CPU strips + wgpu GPU raster)
 //!   FSHOT_BACKEND=vello-gpu     (or FSHOT_GPU=1) anyrender_vello (full compute GPU Vello)
 //! Text and images (docs/FIDELITY.md in known-future):
@@ -25,6 +28,9 @@
 //!                               as one line `FSHOT-REFUSED ["<url>", ...]` (the renderer fetches what a page may have
 //!                               itself, by its rules, before the layout: known_future/weblocal.py)
 //!   FSHOT_NET=open              blitz-net as it was: anything, over http too, from any host (a developer's own pages only)
+//! (wave 0) What an inline <svg>'s <image href|xlink:href> names is resolved against the page's base URL and goes
+//! through the same guard: `file:` and `data:` are read, anything else is refused and listed with FSHOT_NET=local.
+//! An SVG that is a picture itself (<img src>, a CSS url()) loads no file of its own, as in a browser.
 use anyrender::{AntiAliasing, ImageRenderer, PaintScene as _, render_to_buffer};
 use anyrender_skia::{SkiaSceneCache, SkiaScenePainter};
 use anyrender_vello_cpu::VelloCpuImageRenderer;
@@ -61,28 +67,46 @@ enum Backend {
     VelloGpu,
 }
 
+/// known-future (wave 0): stop with one line on stderr and exit status 2 (a wrong rasteriser is the caller's
+/// mistake to see, not a panic's backtrace to read).
+fn backend_error(message: String) -> ! {
+    eprintln!("fshot: error: {message}");
+    std::process::exit(2);
+}
+
+/// The rasteriser every picture of this run is painted with: Skia. Another one named in the environment is
+/// refused, unless FSHOT_ALLOW_NON_SKIA=1 says a developer wants it (header).
 fn selected_backend() -> Backend {
-    if let Ok(v) = std::env::var("FSHOT_BACKEND") {
-        match v.trim().to_ascii_lowercase().as_str() {
-            "" | "vello-cpu" | "vello_cpu" | "cpu" => return Backend::VelloCpu,
-            "skia" => return Backend::Skia,
-            "vello-hybrid" | "vello_hybrid" | "hybrid" => return Backend::VelloHybrid,
-            "vello-gpu" | "vello_gpu" | "gpu" | "vello" => return Backend::VelloGpu,
-            other => panic!(
-                "unknown FSHOT_BACKEND={other:?}; expected vello-cpu, skia, vello-hybrid, or vello-gpu"
-            ),
-        }
+    const NAMES: &str = "skia (the default), or with FSHOT_ALLOW_NON_SKIA=1 vello-cpu, vello-hybrid, vello-gpu";
+    let (backend, asked) = if let Ok(v) = std::env::var("FSHOT_BACKEND") {
+        let backend = match v.trim().to_ascii_lowercase().as_str() {
+            "" | "skia" => Backend::Skia,
+            "vello-cpu" | "vello_cpu" | "cpu" => Backend::VelloCpu,
+            "vello-hybrid" | "vello_hybrid" | "hybrid" => Backend::VelloHybrid,
+            "vello-gpu" | "vello_gpu" | "gpu" | "vello" => Backend::VelloGpu,
+            "tiny-skia" | "tiny_skia" | "tinyskia" => backend_error(format!(
+                "FSHOT_BACKEND={v:?}: tiny-skia is not a rasteriser of fshot (it is not Skia); expected {NAMES}"
+            )),
+            _ => backend_error(format!("unknown FSHOT_BACKEND={v:?}; expected {NAMES}")),
+        };
+        (backend, format!("FSHOT_BACKEND={v}"))
+    } else if std::env::var_os("FSHOT_SKIA").is_some() {
+        (Backend::Skia, "FSHOT_SKIA".to_string())
+    } else if std::env::var_os("FSHOT_HYBRID").is_some() {
+        (Backend::VelloHybrid, "FSHOT_HYBRID".to_string())
+    } else if std::env::var_os("FSHOT_GPU").is_some() {
+        (Backend::VelloGpu, "FSHOT_GPU".to_string())
+    } else {
+        (Backend::Skia, String::new())
+    };
+    if backend != Backend::Skia && std::env::var("FSHOT_ALLOW_NON_SKIA").as_deref() != Ok("1") {
+        backend_error(format!(
+            "{asked} asks for the {backend:?} rasteriser, and fshot paints with Skia only (the renderer's pictures \
+             and its checks against Chrome are Skia's). For development or a benchmark, set FSHOT_ALLOW_NON_SKIA=1 \
+             as well; otherwise leave FSHOT_BACKEND unset or set it to skia."
+        ));
     }
-    if std::env::var_os("FSHOT_SKIA").is_some() {
-        return Backend::Skia;
-    }
-    if std::env::var_os("FSHOT_HYBRID").is_some() {
-        return Backend::VelloHybrid;
-    }
-    if std::env::var_os("FSHOT_GPU").is_some() {
-        return Backend::VelloGpu;
-    }
-    Backend::VelloCpu
+    backend
 }
 
 struct SkiaOffscreen {
@@ -469,21 +493,72 @@ impl NetHandler for WatchFailure {
     }
 }
 
-impl NetProvider for FetchGuard {
-    fn fetch(&self, doc_id: usize, request: Request, handler: Box<dyn NetHandler>) {
-        let url = request.url.to_string();
-        if self.open || matches!(request.url.scheme(), "file" | "data") {
-            let watched = Box::new(WatchFailure { inner: handler, url, failed: Arc::clone(&self.failed) });
-            return self.inner.fetch(doc_id, request, watched);
+const REFUSED: &str = "refused: the layout engine fetches nothing by itself (FSHOT_NET=local)";
+
+impl FetchGuard {
+    /// May this address be fetched by the layout engine itself? `file:` and `data:` always; any other only with
+    /// FSHOT_NET=open. One that may not is recorded (listed as refused, and never waited for).
+    fn allows(&self, url: &url::Url) -> bool {
+        if self.open || matches!(url.scheme(), "file" | "data") {
+            return true;
         }
+        let url = url.to_string();
         {
             let mut r = self.refused.lock().unwrap();
             if !r.contains(&url) {
                 r.push(url.clone());
             }
         }
-        self.failed.lock().unwrap().insert(url.clone());
-        handler.error(url, "refused: the layout engine fetches nothing by itself (FSHOT_NET=local)".into());
+        self.failed.lock().unwrap().insert(url);
+        false
+    }
+}
+
+/// known-future (wave 0): the answer of a fetch made on the runtime's threads, handed to the thread that waits for it
+struct SyncAnswer(std::sync::mpsc::Sender<Result<(String, Bytes), String>>);
+
+impl NetHandler for SyncAnswer {
+    fn bytes(self: Box<Self>, resolved_url: String, bytes: Bytes) {
+        let _ = self.0.send(Ok((resolved_url, bytes)));
+    }
+    fn error(self: Box<Self>, _url: String, error: String) {
+        let _ = self.0.send(Err(error));
+    }
+}
+
+impl NetProvider for FetchGuard {
+    fn fetch(&self, doc_id: usize, request: Request, handler: Box<dyn NetHandler>) {
+        let url = request.url.to_string();
+        if self.allows(&request.url) {
+            let watched = Box::new(WatchFailure { inner: handler, url, failed: Arc::clone(&self.failed) });
+            return self.inner.fetch(doc_id, request, watched);
+        }
+        handler.error(url, REFUSED.into());
+    }
+
+    /// known-future (wave 0): what an inline <svg>'s <image> names (blitz-dom asks for it while usvg builds the
+    /// tree), by the same rule as every other fetch: with FSHOT_NET=local a `file:` or `data:` address is read here
+    /// and now, and any other is refused and listed, with no connection opened. With FSHOT_NET=open an address that
+    /// needs a connection is fetched on the runtime's threads and waited for (30 s at most; this is the main thread,
+    /// which is none of them).
+    fn fetch_sync(&self, doc_id: usize, request: Request) -> Option<Result<(String, Bytes), String>> {
+        let url = request.url.to_string();
+        if !self.allows(&request.url) {
+            return Some(Err(REFUSED.into()));
+        }
+        let result = match self.inner.fetch_sync(doc_id, request.clone()) {
+            Some(result) => result,
+            None => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                self.inner.fetch(doc_id, request, Box::new(SyncAnswer(tx)));
+                rx.recv_timeout(std::time::Duration::from_secs(30))
+                    .unwrap_or_else(|_| Err("no answer in 30 s".into()))
+            }
+        };
+        if result.is_err() {
+            self.failed.lock().unwrap().insert(url);
+        }
+        Some(result)
     }
 }
 
@@ -602,7 +677,11 @@ fn dump(input: &str, output: &str) {
     *blitz_paint::PAINT_LOG.lock().unwrap() = Some(Vec::new());
     blitz_paint::SVG_LOG.lock().unwrap().clear();
     blitz_paint::SVG_PARTS.lock().unwrap().clear();
-    let _ = render(&mut document, 64, 64, false);
+    // (wave 0) the paint-order pass is Skia's too, as every picture is; another rasteriser only for a developer
+    let _ = match selected_backend() {
+        Backend::Skia => SkiaOffscreen::new().render(&mut document, 64, 64, false),
+        _ => render(&mut document, 64, 64, false),
+    };
     let log = blitz_paint::PAINT_LOG.lock().unwrap().take().unwrap();
     let svg_log = std::mem::take(&mut *blitz_paint::SVG_LOG.lock().unwrap());
     let di = LocalName::from("data-i");
@@ -819,6 +898,31 @@ fn dump(input: &str, output: &str) {
             esc(left)
         )
         .unwrap();
+    }
+    // known-future (wave 0): every element whose computed mask-image has a layer that is not `none`, as
+    // [data-i, the computed value as CSS text]. The cascade is Stylo's, so a style attribute's `mask-image: none`,
+    // `!important`, @layer, @supports and @media decide here as they do in a browser: an element a stylesheet rule
+    // gives a mask and its own style attribute takes it from again is not listed (prepare read the rules alone: in 17
+    // of jensen-yes' 63 scenes it took an element for masked that was not).
+    out.push_str("],\"mask\":[");
+    let mut first = true;
+    for (_, node) in doc.tree().iter() {
+        let Some(i) = node.attr(di.clone()) else {
+            continue;
+        };
+        let Some(st) = node.primary_styles() else {
+            continue;
+        };
+        let mask = &st.get_svg().mask_image;
+        if mask.0.iter().all(|image| matches!(image, style::values::generics::image::GenericImage::None)) {
+            continue;
+        }
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        use style_traits::ToCss;
+        write!(out, "[{},{}]", i, json_string(&mask.to_css_string())).unwrap();
     }
     out.push_str("],\"styles\":{");
     let mut first = true;
@@ -1111,6 +1215,9 @@ fn main() {
             };
         }
     }
+    // (wave 0) the rasteriser is settled before anything is read: a run that names another one stops here, whatever
+    // its mode (header)
+    let _ = selected_backend();
     let rt = tokio::runtime::Runtime::new().unwrap();
     let _rt = rt.enter(); // blitz-net fetches assets on the runtime's threads
     let args: Vec<String> = std::env::args().collect();

@@ -19,6 +19,17 @@ pub use url::Url;
 pub trait NetProvider: Send + Sync + 'static {
     fn fetch(&self, doc_id: usize, request: Request, handler: Box<dyn NetHandler>);
 
+    /// known-future (wave 0): fetch a sub-resource and return it before going on, for a parser that cannot
+    /// wait for a [`NetHandler`] (usvg resolves an SVG `<image href>` while it builds the tree).
+    ///
+    /// `None` means this provider has no synchronous path for the request: the caller then treats the
+    /// resource as not available (it must not read the file or open a connection on its own, so a provider
+    /// that guards what a document may reach stays the only way out). `Some(Ok((resolved_url, bytes)))` is
+    /// the resource, `Some(Err(reason))` a fetch the provider refused or that failed.
+    fn fetch_sync(&self, _doc_id: usize, _request: Request) -> Option<Result<(String, Bytes), String>> {
+        None
+    }
+
     /// Whether this provider is a no-op (e.g. `DummyNetProvider`) that will never
     /// deliver resources. When true, callers must NOT register resources as
     /// "pending critical" — doing so blocks painting forever, since the
