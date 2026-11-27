@@ -120,13 +120,13 @@ impl ElementCx<'_, '_> {
         match shape {
             GenericBasicShape::Circle(circle) => {
                 let (cx, cy) = resolve_position(&circle.position, w, h, ox, oy);
-                let r = resolve_shape_radius(&circle.radius, w, h, cx - ox, cy - oy);
+                let r = resolve_circle_radius(&circle.radius, w, h, cx - ox, cy - oy);
                 Some(Circle::new(Point::new(cx, cy), r).into_path(0.1))
             }
             GenericBasicShape::Ellipse(ellipse) => {
                 let (cx, cy) = resolve_position(&ellipse.position, w, h, ox, oy);
-                let rx = resolve_shape_radius(&ellipse.semiaxis_x, w, h, cx - ox, cy - oy);
-                let ry = resolve_shape_radius(&ellipse.semiaxis_y, h, w, cy - oy, cx - ox);
+                let rx = resolve_ellipse_radius(&ellipse.semiaxis_x, w, cx - ox);
+                let ry = resolve_ellipse_radius(&ellipse.semiaxis_y, h, cy - oy);
                 Some(Ellipse::new(Point::new(cx, cy), (rx, ry), 0.0).into_path(0.1))
             }
             GenericBasicShape::Polygon(polygon) => {
@@ -262,41 +262,57 @@ fn resolve_position(
     }
 }
 
-/// Resolve a shape radius keyword or length value
-fn resolve_shape_radius(
+/// The radius of `circle()` (CSS Shapes 1, 3.1) in a reference box `width` x `height`, the centre
+/// at (`cx`, `cy`) from the box's origin.
+///
+/// known-future (wave 2): a percentage is a percentage of `sqrt(width^2 + height^2) / sqrt(2)`, not
+/// of the width (`circle(42% at 50% 45%)` on a 170 x 340 box has a radius of 112.9px, not 71.4px).
+/// The keywords measure distances, so they are never negative, whichever side of the box the centre
+/// is on: with the centre outside the box, the closest side or corner is the near one, at the
+/// centre's distance from the box (it was clamped to a radius of zero).
+fn resolve_circle_radius(
     radius: &GenericShapeRadius<LengthPercentage>,
-    primary_size: f64,
-    secondary_size: f64,
-    center_offset_primary: f64,
-    center_offset_secondary: f64,
+    width: f64,
+    height: f64,
+    cx: f64,
+    cy: f64,
 ) -> f64 {
+    let (near_x, far_x) = side_distances(width, cx);
+    let (near_y, far_y) = side_distances(height, cy);
     match radius {
-        GenericShapeRadius::Length(lp) => resolve_lp(&lp.0, primary_size),
-        GenericShapeRadius::ClosestSide => center_offset_primary
-            .min(primary_size - center_offset_primary)
-            .min(center_offset_secondary)
-            .min(secondary_size - center_offset_secondary)
-            .max(0.0),
-        GenericShapeRadius::FarthestSide => center_offset_primary
-            .max(primary_size - center_offset_primary)
-            .max(center_offset_secondary)
-            .max(secondary_size - center_offset_secondary),
-
-        GenericShapeRadius::FarthestCorner => {
-            let dp = center_offset_primary.max(primary_size - center_offset_primary);
-            let ds = center_offset_secondary.max(secondary_size - center_offset_secondary);
-            dp.hypot(ds)
+        GenericShapeRadius::Length(lp) => {
+            resolve_lp(&lp.0, width.hypot(height) / std::f64::consts::SQRT_2).max(0.0)
         }
-        GenericShapeRadius::ClosestCorner => {
-            let dp = center_offset_primary
-                .min(primary_size - center_offset_primary)
-                .max(0.0);
-            let ds = center_offset_secondary
-                .min(secondary_size - center_offset_secondary)
-                .max(0.0);
-            dp.hypot(ds)
-        }
+        GenericShapeRadius::ClosestSide => near_x.min(near_y),
+        GenericShapeRadius::FarthestSide => far_x.max(far_y),
+        GenericShapeRadius::ClosestCorner => near_x.hypot(near_y),
+        GenericShapeRadius::FarthestCorner => far_x.hypot(far_y),
     }
+}
+
+/// One semi-axis of `ellipse()` (CSS Shapes 1, 3.1): `size` is the reference box's dimension in
+/// that axis and `c` the centre's distance from the box's origin in it.
+///
+/// known-future (wave 2): `closest-side` and `farthest-side` look at the two sides of this axis
+/// alone (they took the nearest of all four sides, as a circle does). An ellipse through a corner
+/// keeps the proportions of the one through the sides, so each semi-axis is `sqrt(2)` times that
+/// side's distance, as for a radial gradient's ending shape.
+fn resolve_ellipse_radius(radius: &GenericShapeRadius<LengthPercentage>, size: f64, c: f64) -> f64 {
+    let (near, far) = side_distances(size, c);
+    match radius {
+        GenericShapeRadius::Length(lp) => resolve_lp(&lp.0, size).max(0.0),
+        GenericShapeRadius::ClosestSide => near,
+        GenericShapeRadius::FarthestSide => far,
+        GenericShapeRadius::ClosestCorner => near * std::f64::consts::SQRT_2,
+        GenericShapeRadius::FarthestCorner => far * std::f64::consts::SQRT_2,
+    }
+}
+
+/// The distances from a centre at `c` to the nearer and the farther of the two sides of a box that
+/// runs from 0 to `size` in one axis.
+fn side_distances(size: f64, c: f64) -> (f64, f64) {
+    let (a, b) = (c.abs(), (size - c).abs());
+    (a.min(b), a.max(b))
 }
 
 type GenericPathCommand<Angle, N> = GenericShapeCommand<Angle, N, GenericPosition<N, N>, N>;
@@ -493,5 +509,70 @@ fn resolve_axis_endpoint<N>(
     match endpoint {
         AxisEndPoint::ToPosition(pos) => resolve(pos),
         AxisEndPoint::ByCoordinate(val) => cur_val + resolve(val),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use style::values::computed::Percentage;
+    use style::values::generics::NonNegative;
+
+    type Radius = GenericShapeRadius<LengthPercentage>;
+
+    fn px(v: f32) -> Radius {
+        GenericShapeRadius::Length(NonNegative(LengthPercentage::new_length(CSSPixelLength::new(v))))
+    }
+
+    fn pct(v: f32) -> Radius {
+        GenericShapeRadius::Length(NonNegative(LengthPercentage::new_percent(Percentage(v))))
+    }
+
+    fn close(a: f64, b: f64) {
+        assert!((a - b).abs() < 1e-3, "{a} is not {b}");
+    }
+
+    #[test]
+    fn a_circle_percentage_is_of_the_normalised_diagonal() {
+        // circle(42% at 50% 45%) on 170 x 340: 0.42 * sqrt((170^2 + 340^2) / 2)
+        close(resolve_circle_radius(&pct(0.42), 170.0, 340.0, 85.0, 153.0), 112.8933);
+        // a square box: the percentage is of its side
+        close(resolve_circle_radius(&pct(0.5), 200.0, 200.0, 100.0, 100.0), 100.0);
+        close(resolve_circle_radius(&px(30.0), 170.0, 340.0, 85.0, 153.0), 30.0);
+    }
+
+    #[test]
+    fn circle_keywords_inside_the_box() {
+        let (w, h, cx, cy) = (200.0, 100.0, 50.0, 30.0);
+        close(resolve_circle_radius(&Radius::ClosestSide, w, h, cx, cy), 30.0);
+        close(resolve_circle_radius(&Radius::FarthestSide, w, h, cx, cy), 150.0);
+        close(resolve_circle_radius(&Radius::ClosestCorner, w, h, cx, cy), 50f64.hypot(30.0));
+        close(resolve_circle_radius(&Radius::FarthestCorner, w, h, cx, cy), 150f64.hypot(70.0));
+    }
+
+    #[test]
+    fn circle_keywords_with_the_centre_outside_the_box() {
+        // the centre 40px left of and 20px above a 200 x 100 box
+        let (w, h, cx, cy) = (200.0, 100.0, -40.0, -20.0);
+        // N3: the closest corner is the box's own, 40 x 20 away: not a radius of zero
+        close(resolve_circle_radius(&Radius::ClosestCorner, w, h, cx, cy), 40f64.hypot(20.0));
+        close(resolve_circle_radius(&Radius::ClosestSide, w, h, cx, cy), 20.0);
+        close(resolve_circle_radius(&Radius::FarthestSide, w, h, cx, cy), 240.0);
+        close(resolve_circle_radius(&Radius::FarthestCorner, w, h, cx, cy), 240f64.hypot(120.0));
+        // past the far edges too
+        close(resolve_circle_radius(&Radius::ClosestCorner, w, h, 230.0, 130.0), 30f64.hypot(30.0));
+    }
+
+    #[test]
+    fn an_ellipse_axis_looks_at_its_own_sides() {
+        // ellipse(48% 30% at 50% 50%) on 170 x 340
+        close(resolve_ellipse_radius(&pct(0.48), 170.0, 85.0), 81.6);
+        close(resolve_ellipse_radius(&pct(0.30), 340.0, 170.0), 102.0);
+        // closest-side in x is the nearer of left and right, whatever the centre's height
+        close(resolve_ellipse_radius(&Radius::ClosestSide, 200.0, 50.0), 50.0);
+        close(resolve_ellipse_radius(&Radius::FarthestSide, 200.0, 50.0), 150.0);
+        close(resolve_ellipse_radius(&Radius::ClosestSide, 200.0, -40.0), 40.0);
+        close(resolve_ellipse_radius(&Radius::ClosestCorner, 200.0, 50.0), 50.0 * std::f64::consts::SQRT_2);
+        close(resolve_ellipse_radius(&Radius::FarthestCorner, 200.0, 50.0), 150.0 * std::f64::consts::SQRT_2);
     }
 }

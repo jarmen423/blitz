@@ -314,26 +314,32 @@ fn radial_gradient(
         resolve_gradient_length(&position.vertical, rect.height()),
     );
 
+    // known-future (wave 2): how far the centre is from the nearer and the farther side of the box in each
+    // direction. They are distances, so never negative, wherever the centre is: with the centre outside the box,
+    // `closest-side` is how far the centre is from the box (Blink's `RadiusToSide` takes `fabs` of each). They
+    // were `min(x, width - x)`, which is negative there: a circle `closest-side at -30px 50%` had a radius of
+    // -30px, the same circle mirrored as long as its stops were percentages, and with stops in pixels a gradient
+    // whose stops ran the wrong way from the centre (it came out as its last stop's colour, where Chrome draws
+    // the first 60px of it).
+    let sides = |centre: f64, size: f64| {
+        let (a, b) = (centre.abs(), (size - centre).abs());
+        (a.min(b), a.max(b))
+    };
+    let (near_x, far_x) = sides(width_px, rect.width());
+    let (near_y, far_y) = sides(height_px, rect.height());
+
     let gradient_scale: Option<Vec2> = match shape {
         GenericEndingShape::Circle(circle) => {
             let scale = match circle {
                 GenericCircle::Extent(extent) => match extent {
-                    ShapeExtent::FarthestSide => width_px
-                        .max(rect.width() - width_px)
-                        .max(height_px.max(rect.height() - height_px)),
-                    ShapeExtent::ClosestSide => width_px
-                        .min(rect.width() - width_px)
-                        .min(height_px.min(rect.height() - height_px)),
+                    ShapeExtent::FarthestSide => far_x.max(far_y),
+                    ShapeExtent::ClosestSide => near_x.min(near_y),
                     // known-future (wave 1b): a circle sized to a corner has the distance from its centre to
                     // that corner as its radius (CSS Images 3, 3.2.1). It was `(dx + dy) / sqrt(2)`, which is that
                     // distance only where dx = dy and less than it everywhere else (`circle at 38% 50%` in a box
                     // of 520 x 440: 383.5 px for 390.3 px)
-                    ShapeExtent::FarthestCorner => width_px
-                        .max(rect.width() - width_px)
-                        .hypot(height_px.max(rect.height() - height_px)),
-                    ShapeExtent::ClosestCorner => width_px
-                        .min(rect.width() - width_px)
-                        .hypot(height_px.min(rect.height() - height_px)),
+                    ShapeExtent::FarthestCorner => far_x.hypot(far_y),
+                    ShapeExtent::ClosestCorner => near_x.hypot(near_y),
                     _ => 0.0,
                 },
                 GenericCircle::Radius(radius) => radius.0.px() as f64,
@@ -343,20 +349,14 @@ fn radial_gradient(
         GenericEndingShape::Ellipse(ellipse) => match ellipse {
             GenericEllipse::Extent(extent) => match extent {
                 ShapeExtent::FarthestCorner | ShapeExtent::FarthestSide => {
-                    let mut scale = Vec2::new(
-                        width_px.max(rect.width() - width_px),
-                        height_px.max(rect.height() - height_px),
-                    );
+                    let mut scale = Vec2::new(far_x, far_y);
                     if *extent == ShapeExtent::FarthestCorner {
                         scale *= 2.0_f64.sqrt();
                     }
                     Some(scale)
                 }
                 ShapeExtent::ClosestCorner | ShapeExtent::ClosestSide => {
-                    let mut scale = Vec2::new(
-                        width_px.min(rect.width() - width_px),
-                        height_px.min(rect.height() - height_px),
-                    );
+                    let mut scale = Vec2::new(near_x, near_y);
                     if *extent == ShapeExtent::ClosestCorner {
                         scale *= 2.0_f64.sqrt();
                     }
@@ -370,6 +370,25 @@ fn radial_gradient(
             )),
         },
     };
+
+    // known-future (wave 2): an ending shape with no size (a circle of radius zero, an ellipse of no width or no
+    // height) is its last stop's colour everywhere, whatever the stops are, as Chrome draws it. Its stops are not
+    // placed along it: a stop at a length is that length over the radius, which is no place when the radius is
+    // zero, so a gradient with such stops (`circle 0px, red 20px, blue 60px`) was left with no stops at all and
+    // drew nothing. The last stop alone is kept, and `to_peniko_gradient` makes the solid colour of it.
+    if let Some(scale) = gradient_scale
+        && !(scale.x > 0.0 && scale.y > 0.0)
+    {
+        if let Some(color) = items.iter().rev().find_map(|item| match item {
+            GenericGradientItem::SimpleColorStop(color)
+            | GenericGradientItem::ComplexColorStop { color, .. } => Some(color),
+            GenericGradientItem::InterpolationHint(_) => None,
+        }) {
+            let color = color.resolve_to_absolute(current_color).as_dynamic_color();
+            gradient.stops.push(ColorStop { color, offset: 1.0 });
+        }
+        return (gradient, Some(Affine::scale(0.0)));
+    }
 
     let gradient_transform = {
         // If the gradient has no valid scale, we don't need to calculate the color stops
@@ -1175,6 +1194,81 @@ mod tests {
         assert_eq!(radius(ShapeExtent::FarthestSide, (0.25, 0.25), (120.0, 160.0)), 120.0);
         // and the centre is where it was put
         assert_eq!(ending_shape(farthest, false, (0.25, 0.75), (120.0, 160.0)).1, (30.0, 120.0));
+    }
+
+    /// known-future (wave 2, the audit's N2): with the centre outside the box, the distances to its sides are
+    /// still distances. `closest-side` and `closest-corner` had radii under zero there.
+    #[test]
+    fn a_shape_sized_from_outside_the_box_has_radii_that_are_not_negative() {
+        let circle = |extent, at, size| ending_shape(extent, false, at, size).0.0;
+        let ellipse = |extent, at, size| ending_shape(extent, true, at, size).0;
+        let size = (120.0, 160.0);
+        // the centre 30px left of the box, half way down: the closest side (the left one) is 30px away
+        assert_eq!(circle(ShapeExtent::ClosestSide, (-0.25, 0.5), size), 30.0, "it was -30");
+        assert_eq!(circle(ShapeExtent::FarthestSide, (-0.25, 0.5), size), 150.0);
+        // past the right edge and under the bottom one
+        assert_eq!(circle(ShapeExtent::ClosestSide, (1.25, 1.125), size), 20.0);
+        assert_eq!(circle(ShapeExtent::ClosestCorner, (1.25, 1.125), size), 30.0_f64.hypot(20.0));
+        // an ellipse meets the closest side in each direction; to the corner it is sqrt(2) times that
+        assert_eq!(ellipse(ShapeExtent::ClosestSide, (-0.25, -0.125), size), (30.0, 20.0), "it was -30 x -20");
+        let (rx, ry) = ellipse(ShapeExtent::ClosestCorner, (-0.25, -0.125), size);
+        assert!((rx - 30.0 * 2.0_f64.sqrt()).abs() < 1e-9 && (ry - 20.0 * 2.0_f64.sqrt()).abs() < 1e-9, "{rx} x {ry}");
+        assert_eq!(ellipse(ShapeExtent::FarthestSide, (-0.25, -0.125), size), (150.0, 180.0));
+        // inside the box nothing has changed
+        assert_eq!(circle(ShapeExtent::ClosestSide, (0.25, 0.25), size), 30.0);
+        assert_eq!(ellipse(ShapeExtent::ClosestSide, (0.25, 0.25), size), (30.0, 40.0));
+    }
+
+    /// known-future (wave 2, the audit's N1): an ending shape with no size is the last stop's colour, whatever
+    /// its stops are. With stops at lengths it had no stops left, and nothing was drawn.
+    #[test]
+    fn a_shape_with_no_size_is_its_last_stops_colour_whatever_the_stops() {
+        let srgb = ColorInterpolationMethod { space: StyloColorSpace::Srgb, hue: HueInterpolationMethod::Shorter };
+        let (red, blue) = (AbsoluteColor::srgb_legacy(255, 0, 0, 1.0), AbsoluteColor::srgb_legacy(0, 0, 255, 1.0));
+        let at = |x: f32, y: f32| GenericPosition {
+            horizontal: LengthPercentage::new_percent(Percentage(x)),
+            vertical: LengthPercentage::new_percent(Percentage(y)),
+        };
+        let px = |v: f32| LengthPercentage::new_length(CSSPixelLength::new(v));
+        let at_length = |c: AbsoluteColor, v: f32| GenericGradientItem::ComplexColorStop {
+            color: GenericColor::Absolute(c),
+            position: px(v),
+        };
+        let plain = |c: AbsoluteColor| GenericGradientItem::SimpleColorStop(GenericColor::Absolute(c));
+        type Shape = EndingShape<NonNegative<CSSPixelLength>, NonNegative<LengthPercentage>>;
+        let circle = |r: f32| -> Shape { GenericEndingShape::Circle(GenericCircle::Radius(NonNegative(CSSPixelLength::new(r)))) };
+        let ellipse = |rx: f32, ry: f32| -> Shape {
+            GenericEndingShape::Ellipse(GenericEllipse::Radii(NonNegative(px(rx)), NonNegative(px(ry))))
+        };
+        let closest_side: Shape = GenericEndingShape::Circle(GenericCircle::Extent(ShapeExtent::ClosestSide));
+        let rect = Rect::new(0.0, 0.0, 170.0, 120.0);
+        let blue_rgba = [0.0, 0.0, 1.0, 1.0];
+        let drawn = |shape: &Shape, position: &GenericPosition<LengthPercentage, LengthPercentage>, items: Vec<GradientItem<LengthPercentage>>, flags| {
+            let items: OwnedSlice<GradientItem<LengthPercentage>> = items.into();
+            let (gradient, transform) = radial_gradient((shape, position, &items, flags), rect, &AbsoluteColor::BLACK, &srgb);
+            // what `to_peniko_gradient` does with it
+            assert!(!is_drawable(&gradient, transform), "a shape with no size is no shader");
+            solid_gradient(&gradient).stops.iter().map(|s| s.color.to_alpha_color::<color::Srgb>().components).collect::<Vec<_>>()
+        };
+        let none = GradientFlags::empty();
+        // `circle 0px, red 20px, blue 60px`: blue, as Chrome draws it (it was transparent: no stop was kept)
+        assert_eq!(drawn(&circle(0.0), &at(0.5, 0.5), vec![at_length(red, 20.0), at_length(blue, 60.0)], none), [blue_rgba; 2]);
+        // the same with no places for the stops, as before
+        assert_eq!(drawn(&circle(0.0), &at(0.5, 0.5), vec![plain(red), plain(blue)], none), [blue_rgba; 2]);
+        // a circle that meets the side its centre is on
+        assert_eq!(drawn(&closest_side, &at(0.0, 0.5), vec![at_length(red, 20.0), at_length(blue, 60.0)], none), [blue_rgba; 2]);
+        // an ellipse of no width, and one of no height
+        assert_eq!(drawn(&ellipse(0.0, 40.0), &at(0.5, 0.5), vec![at_length(red, 10.0), at_length(blue, 60.0)], none), [blue_rgba; 2]);
+        assert_eq!(drawn(&ellipse(40.0, 0.0), &at(0.5, 0.5), vec![at_length(red, 10.0), at_length(blue, 60.0)], none), [blue_rgba; 2]);
+        // repeating: the last stop's colour too
+        assert_eq!(
+            drawn(&circle(0.0), &at(0.5, 0.5), vec![at_length(red, 0.0), at_length(blue, 20.0)], GradientFlags::REPEATING),
+            [blue_rgba; 2]
+        );
+        // a circle with a radius keeps its stops
+        let items: OwnedSlice<GradientItem<LengthPercentage>> = vec![at_length(red, 20.0), at_length(blue, 60.0)].into();
+        let (gradient, transform) = radial_gradient((&circle(40.0), &at(0.5, 0.5), &items, none), rect, &AbsoluteColor::BLACK, &srgb);
+        assert!(is_drawable(&gradient, transform) && gradient.stops.len() >= 2);
     }
 
     /// an ellipse sized to a corner was already as CSS Images 3 (3.2.1) has it: it passes through the corner, with the
