@@ -131,6 +131,10 @@ pub struct Node {
     /// its opacity, filter, mask and clip-path, but not inside its overflow clip, and its own box
     /// does not bound them.
     pub adopts_oof: Cell<bool>,
+    /// known-future (wave 2): how far `position: sticky` moves this box from its place in the flow
+    /// (CSS pixels; zero for any other box). Set after layout (`layout::sticky`), and added to
+    /// `Layout.location` wherever the box is placed: see [`Node::placed_location`].
+    pub sticky_offset: Cell<taffy::Point<f32>>,
     /// known-future: for a cell of a table whose borders collapse, the border widths its box holds
     /// (half of each collapsed border, set by the table's layout); its own computed borders are not
     /// laid out or painted then.
@@ -306,6 +310,27 @@ impl Node {
         &self.layout_data().final_layout
     }
 
+    /// known-future (wave 2): which of Blink's text rules (`parley::TextMode`) the text this node
+    /// lays out follows: what its own style asks for (`stylo_to_parley::text_mode`), or its
+    /// parent's for a box with no style of its own (an anonymous block).
+    pub fn text_mode(&self) -> Option<parley::TextMode> {
+        let style = self.primary_styles().or_else(|| {
+            self.parent
+                .and_then(|parent_id| self.tree().get(parent_id))
+                .and_then(|parent| parent.primary_styles())
+        });
+        style.as_deref().and_then(|style| crate::stylo_to_parley::text_mode(style))
+    }
+
+    /// known-future (wave 2): where the box is placed against its containing block: its laid-out
+    /// (rounded) location, moved by its sticky offset if it is a `position: sticky` box.
+    #[inline]
+    pub fn placed_location(&self) -> taffy::Point<f32> {
+        let location = self.final_layout().location;
+        let sticky = self.sticky_offset.get();
+        taffy::Point { x: location.x + sticky.x, y: location.y + sticky.y }
+    }
+
     #[inline]
     pub fn final_layout_mut(&mut self) -> &mut Layout {
         &mut self.layout_data_mut().final_layout
@@ -454,6 +479,7 @@ impl Node {
             stacking_context: None,
             sc_contribution_cache: RefCell::new(ThinVec::new()),
             adopts_oof: Cell::new(false),
+            sticky_offset: Cell::new(taffy::Point::ZERO),
             collapsed_cell_border: Cell::new(None),
             container_query_size: [AtomicU32::new(u32::MAX), AtomicU32::new(u32::MAX)],
             container_queried: AtomicBool::new(false),
@@ -1537,8 +1563,8 @@ impl Node {
             .primary_styles()
             .is_some_and(|style| style.clone_pointer_events() == PointerEvents::None);
 
-        let mut x = x - self.final_layout().location.x + self.scroll_offset().x as f32;
-        let mut y = y - self.final_layout().location.y + self.scroll_offset().y as f32;
+        let mut x = x - self.placed_location().x + self.scroll_offset().x as f32;
+        let mut y = y - self.placed_location().y + self.scroll_offset().y as f32;
 
         if let Some(t) = self.transform().as_deref() {
             let p = t.inverse() * kurbo::Point::new(x as f64 * scale, y as f64 * scale);
@@ -1852,8 +1878,8 @@ impl Node {
 
     /// Computes the Document-relative coordinates of the `Node`
     pub fn absolute_position(&self, x: f32, y: f32) -> crate::util::Point<f32> {
-        let x = x + self.final_layout().location.x - self.scroll_offset().x as f32;
-        let y = y + self.final_layout().location.y - self.scroll_offset().y as f32;
+        let x = x + self.placed_location().x - self.scroll_offset().x as f32;
+        let y = y + self.placed_location().y - self.scroll_offset().y as f32;
 
         // Recurse up the positioning hierarchy
         self.containing_block()

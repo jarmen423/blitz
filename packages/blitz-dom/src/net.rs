@@ -60,7 +60,17 @@ pub struct FontFaceOverrides {
     /// `font-stretch` (`font-width`) descriptor as a single width. Like
     /// `weight`, we record the lower bound of Stylo's range.
     pub width: Option<parley::fontique::FontWidth>,
+    /// known-future (wave 2): the `unicode-range` descriptor, as inclusive ranges of code points:
+    /// the face is used for those characters alone (patches/fontique-0.13.0)
+    pub unicode_ranges: Option<Vec<(u32, u32)>>,
+    /// known-future (wave 2): where the rule comes among the `@font-face` rules read so far (from
+    /// 1 up): of the faces that could draw a character, the one declared last is used
+    pub order: Option<u32>,
 }
+
+/// known-future (wave 2): the number of `@font-face` rules read so far, in this process: each rule
+/// takes the next number as its place among them ([`FontFaceOverrides::order`]).
+static FONT_FACE_RULES_READ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 #[derive(Clone, Debug)]
 pub enum Resource {
@@ -433,22 +443,44 @@ pub(crate) fn fetch_font_face_rules<'a>(
                 // Capture the @font-face descriptors so parley can register
                 // the font under the CSS-declared family name (and weight /
                 // style) rather than whatever metadata the TTF reports.
+                // known-future (wave 2): a descriptor the rule leaves out has its initial value,
+                // `normal` (CSS Fonts 4, 4.4), whatever the font file says of itself: a bold file
+                // declared with no `font-weight` is the family's face of weight 400 (it was
+                // registered at the file's own weight, so that two faces of one family that
+                // differ only in `unicode-range` were not seen as one face: the family's digits
+                // came from one file, and its letters from no file of the family at all).
                 let overrides = FontFaceOverrides {
                     family_name: Some(family.name.to_string()),
                     weight: descriptor
                         .font_weight
                         .as_ref()
-                        .and_then(|range| range.compute().map(|r| r.0.value())),
+                        .and_then(|range| range.compute().map(|r| r.0.value()))
+                        .or(Some(400.0)),
                     weight_max: descriptor
                         .font_weight
                         .as_ref()
                         .and_then(|range| range.compute().map(|r| r.1.value())),
-                    style: descriptor.font_style.as_ref().map(stylo_to_fontique_style),
-                    width: descriptor.font_width.as_ref().and_then(|range| {
-                        range
-                            .compute()
-                            .map(|w| parley::fontique::FontWidth::from_percentage(w.0.0.to_float()))
-                    }),
+                    style: descriptor
+                        .font_style
+                        .as_ref()
+                        .map(stylo_to_fontique_style)
+                        .or(Some(parley::fontique::FontStyle::Normal)),
+                    width: descriptor
+                        .font_width
+                        .as_ref()
+                        .and_then(|range| {
+                            range.compute().map(|w| {
+                                parley::fontique::FontWidth::from_percentage(w.0.0.to_float())
+                            })
+                        })
+                        .or(Some(parley::fontique::FontWidth::NORMAL)),
+                    unicode_ranges: descriptor
+                        .unicode_range
+                        .as_ref()
+                        .map(|ranges| ranges.iter().map(|r| (r.start, r.end)).collect()),
+                    order: Some(
+                        FONT_FACE_RULES_READ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
+                    ),
                 };
                 Some((src, overrides))
             }

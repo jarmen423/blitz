@@ -583,6 +583,16 @@ impl BaseDocument {
         for idx in 0..len {
             let style_image = &style_images[idx];
             let new_image = match style_image {
+                // known-future (wave 2): `url(#id)` names something in this document (an inline SVG
+                // <mask>, which the painter draws: svg_refs.rs), not a picture: the page was fetched
+                // again and read as an image
+                #[cfg(feature = "svg")]
+                StyloImage::Url(ComputedUrl::Valid(new_url))
+                    if new_url.fragment().is_some_and(|f| !f.is_empty())
+                        && self.url.is_same_document(new_url) =>
+                {
+                    None
+                }
                 StyloImage::Url(ComputedUrl::Valid(new_url)) => {
                     let old_image = elem_images[idx].as_ref();
                     let old_image_url = old_image.map(|data| &data.url);

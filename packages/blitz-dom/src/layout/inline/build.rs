@@ -45,6 +45,9 @@ pub(crate) fn build_inline_layout_into(
             ..Default::default()
         });
 
+    // known-future (wave 2): the text follows the rules Blink has for the root's `text-rendering`
+    let _text_mode = parley::TextModeScope::enter(root_node.text_mode());
+
     // Create a parley tree builder
     let mut builder = layout_ctx.tree_builder(font_ctx, scale, true, &parley_style);
     // Break lines where Blink does: after every run of spaces, whatever follows (UAX 14's LB13 forbids a break

@@ -42,6 +42,7 @@ pub(crate) mod stylo {
 pub(crate) mod parley {
     pub(crate) use parley::BaseDirection;
     pub(crate) use parley::FontFeature;
+    pub use parley::TextMode;
     pub(crate) use parley::FontVariation;
     pub(crate) use parley::fontique::QueryFamily;
     pub(crate) use parley::layout::Alignment;
@@ -713,5 +714,37 @@ mod tests {
         assert_eq!(flat, vec![(*b"tnum", 1), (*b"tnum", 0)]);
         let last_tnum = flat.iter().rev().find(|(tag, _)| tag == b"tnum").unwrap();
         assert_eq!(last_tnum.1, 0);
+    }
+}
+
+/// known-future (wave 2): which of Blink's text rules on Linux (`parley::TextMode`) the text of an
+/// element with this style follows.
+///
+/// The environment variable `FSHOT_GEOMETRIC_PRECISION` (read once) decides how that is chosen:
+///  - `auto`: by the element's own `text-rendering`, as Chrome does. `geometricPrecision` gives
+///    sub-pixel glyph positions (`TextMode::GeometricPrecision`); anything else gives Chrome's
+///    default, whole-pixel advances and positions (`TextMode::WholePixel`). fshot sets this.
+///  - `1`: every element as under `geometricPrecision`; `0`: parley's plain rule for every element.
+///  - unset, or anything else: `None`, nothing is chosen here (parley's own default).
+pub fn text_mode(style: &stylo::ComputedValues) -> Option<parley::TextMode> {
+    use style::computed_values::text_rendering::T as TextRendering;
+    #[derive(Clone, Copy)]
+    enum Choice {
+        Fixed(Option<parley::TextMode>),
+        ByStyle,
+    }
+    static CHOICE: std::sync::OnceLock<Choice> = std::sync::OnceLock::new();
+    let choice = *CHOICE.get_or_init(|| match std::env::var("FSHOT_GEOMETRIC_PRECISION").as_deref() {
+        Ok("auto") => Choice::ByStyle,
+        Ok("1") => Choice::Fixed(Some(parley::TextMode::GeometricPrecision)),
+        Ok("0") => Choice::Fixed(Some(parley::TextMode::Plain)),
+        _ => Choice::Fixed(None),
+    });
+    match choice {
+        Choice::Fixed(mode) => mode,
+        Choice::ByStyle => Some(match style.get_inherited_text().text_rendering {
+            TextRendering::Geometricprecision => parley::TextMode::GeometricPrecision,
+            _ => parley::TextMode::WholePixel,
+        }),
     }
 }

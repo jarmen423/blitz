@@ -97,6 +97,9 @@ pub(crate) struct DecorationStackEntry {
     /// This node's (inherited) text fill colour, used for the glyphs of runs whose
     /// innermost node is this one.
     pub(crate) fill_color: Color,
+    /// known-future (wave 2): this node's (inherited) `-webkit-text-stroke`: the colour and
+    /// the width in device pixels, when the width is not zero.
+    pub(crate) text_stroke: Option<(Color, f64)>,
     /// The decoration this node introduces as a decorating box, if any.
     pub(crate) decoration: Option<ResolvedDecoration>,
     /// This node's (inherited) `text-shadow` list, or `None` for `text-shadow: none`.
@@ -131,6 +134,7 @@ pub(crate) fn resolve_decoration_entry(
         return DecorationStackEntry {
             node_id,
             fill_color: Color::BLACK,
+            text_stroke: None,
             decoration: None,
             text_shadows: None,
         };
@@ -143,6 +147,15 @@ pub(crate) fn resolve_decoration_entry(
         ._webkit_text_fill_color
         .resolve_to_absolute(&itext.color)
         .as_srgb_color();
+    // known-future (wave 2): `-webkit-text-stroke`
+    let stroke_width = itext._webkit_text_stroke_width.to_f64_px() * scale;
+    let text_stroke = (stroke_width > 0.0).then(|| {
+        let color = itext
+            ._webkit_text_stroke_color
+            .resolve_to_absolute(&itext.color)
+            .as_srgb_color();
+        (color, stroke_width)
+    });
 
     // `text-shadow` inherits, so the run's innermost node carries the effective list.
     // Lengths are in CSS pixels; glyph runs are laid out in device pixels, so scale here.
@@ -209,6 +222,7 @@ pub(crate) fn resolve_decoration_entry(
     DecorationStackEntry {
         node_id,
         fill_color,
+        text_stroke,
         decoration,
         text_shadows,
     }
@@ -443,6 +457,7 @@ pub(crate) fn flush_line_decorations(
     let TextPaintOptions {
         scale,
         brush_override,
+        ..
     } = options;
     let (transform, brush_override) = match shadow {
         Some((shadow, _)) => (
@@ -717,7 +732,7 @@ pub(crate) fn draw_line_text_shadows(
 
             let shadow_transform = transform * Affine::translate(shadow.offset);
             for run in batch() {
-                draw_glyph_run(scene, &run, shadow.color, shadow_transform);
+                draw_glyph_run(scene, &run, shadow.color, shadow_transform, options.text_mode, options.cut);
             }
             if has_decorations {
                 flush_line_decorations(

@@ -550,13 +550,12 @@ spec = "https://www.w3.org/TR/css-text-4/#white-space-property"
 derive_value_info = false
 
 [-webkit-text-stroke]
-engine = "gecko"
 sub_properties = ["-webkit-text-stroke-width", "-webkit-text-stroke-color"]
 spec = "https://compat.spec.whatwg.org/#the-webkit-text-stroke"
 derive_serialize = true
 
+# known-future (wave 2): in Servo mode too (it was Gecko's alone: `-webkit-line-clamp: 3` was dropped)
 [-webkit-line-clamp]
-engine = "gecko"
 flags = "IS_LEGACY_SHORTHAND ALLOWS_DISABLED_SUBPROPERTIES"
 sub_properties = ["line-clamp"]
 spec = "https://drafts.csswg.org/css-overflow-4/#webkit-line-clamp"

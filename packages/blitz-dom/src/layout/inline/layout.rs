@@ -341,6 +341,10 @@ impl LayoutPassState<'_> {
         inputs: taffy::tree::LayoutInput,
         block_ctx: &mut BlockContext<'_>,
     ) -> taffy::LayoutOutput {
+        // known-future (wave 2): lines are broken, and their boxes sized, by the rules Blink has
+        // for this element's `text-rendering` (the layout was built by them: inline/build.rs)
+        let _text_mode = parley::TextModeScope::enter(self.nodes[node_id].text_mode());
+
         let scale = self.viewport.scale();
         let LayoutInput {
             known_dimensions,
@@ -1056,6 +1060,55 @@ impl LayoutPassState<'_> {
             if is_bfc_root {
                 height = height.max(float_height_contribution * scale)
             };
+        }
+
+        // known-future (wave 2): `line-clamp` (and `-webkit-line-clamp`) and `text-overflow:
+        // ellipsis`. A box clamped to N lines is as tall as its first N lines, and its Nth line
+        // ends with an ellipsis; a line that overflows a box which clips it ends with one too.
+        // (Blink clamps only a `-webkit-box` with `-webkit-box-orient: vertical`; a box that
+        // sets `-webkit-line-clamp` is taken to be one.)
+        inline_layout.ellipses.clear();
+        if has_inline_content {
+            use style::values::computed::Overflow;
+            use style::values::specified::text::TextOverflowSide;
+            let (clamp, ellipsis_on_overflow) = self.nodes[node_id]
+                .primary_styles()
+                .map(|s| {
+                    let clamp = s
+                        .get_box()
+                        .line_clamp
+                        .max_lines
+                        .lines_value()
+                        .map(|lines| lines.0.max(1) as usize);
+                    let clips = s.get_box().overflow_x != Overflow::Visible;
+                    let ellipsis =
+                        matches!(s.get_text().text_overflow.second, TextOverflowSide::Ellipsis);
+                    (clamp, clips && ellipsis)
+                })
+                .unwrap_or((None, false));
+            let counted_lines = trailing_empty_line.unwrap_or(line_count);
+            if let Some(max_lines) = clamp.filter(|max_lines| *max_lines < counted_lines) {
+                if let Some(last) = inline_layout.layout.get(max_lines - 1) {
+                    height = height.min(last.metrics().block_max_coord);
+                    inline_layout.ellipses.push(crate::node::LineEllipsis {
+                        line: max_lines - 1,
+                        max_advance: width,
+                        clamped: true,
+                    });
+                }
+            } else if ellipsis_on_overflow {
+                for (index, line) in inline_layout.layout.lines().enumerate() {
+                    let metrics = line.metrics();
+                    let content_end = metrics.offset + metrics.advance - metrics.hanging_advance;
+                    if content_end > width + 0.01 {
+                        inline_layout.ellipses.push(crate::node::LineEllipsis {
+                            line: index,
+                            max_advance: width,
+                            clamped: false,
+                        });
+                    }
+                }
+            }
         }
 
         // Note: `width` and `height` are content-box measurements of the inline content.

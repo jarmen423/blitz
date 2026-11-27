@@ -53,6 +53,9 @@ impl From<StyloBackgroundClip> for BoxModelBox {
             // TODO: support BorderArea
             StyloBackgroundClip::BorderArea => Self::BorderBox,
             StyloBackgroundClip::Text => Self::BorderBox,
+            // `mask-clip: no-clip` names no box: `ImageLayerStyles::paint_area` holds what such a
+            // layer is painted over (known-future, wave 2)
+            StyloBackgroundClip::NoClip => Self::BorderBox,
         }
     }
 }
@@ -85,6 +88,10 @@ pub(super) struct ImageLayerStyles<'a> {
     pub text_clip: bool,
     pub origin: BoxModelBox,
     pub attachment: StyloBackgroundAttachment,
+    /// known-future (wave 2): for a mask layer with `mask-clip: no-clip`, the area the layer is
+    /// painted over instead of a clip box, in the element's own (scaled) space: a repeated image
+    /// is tiled over all of it. `None` for every other layer. Set by the mask painter.
+    pub paint_area: Option<Rect>,
 }
 
 impl<'a> ImageLayerStyles<'a> {
@@ -104,6 +111,7 @@ impl<'a> ImageLayerStyles<'a> {
             text_clip: *get_cyclic(&bg_styles.background_clip.0, idx) == StyloBackgroundClip::Text,
             origin: (*get_cyclic(&bg_styles.background_origin.0, idx)).into(),
             attachment: *get_cyclic(&bg_styles.background_attachment.0, idx),
+            paint_area: None,
         }
     }
 
@@ -124,6 +132,7 @@ impl<'a> ImageLayerStyles<'a> {
             origin: (*get_cyclic(&svg_styles.mask_origin.0, idx)).into(),
             // There is no `mask-attachment` property
             attachment: StyloBackgroundAttachment::Scroll,
+            paint_area: None,
         }
     }
 }
@@ -582,10 +591,14 @@ impl ElementCx<'_, '_> {
 
         let BackgroundRepeat(repeat_x, repeat_y) = layer.repeat;
 
+        // (known-future, wave 2) a `mask-clip: no-clip` layer repeats over its paint area
+        let area = layer.paint_area.map_or(origin_rect, |area| area.union(origin_rect));
         let x = raster_axis_tiling(
             *repeat_x,
             origin_rect.x0,
             origin_rect.width(),
+            area.x0,
+            area.width(),
             bg_pos.x,
             bg_size.width,
             image_width,
@@ -595,6 +608,8 @@ impl ElementCx<'_, '_> {
             *repeat_y,
             origin_rect.y0,
             origin_rect.height(),
+            area.y0,
+            area.height(),
             bg_pos.y,
             bg_size.height,
             image_height,
@@ -642,7 +657,7 @@ impl ElementCx<'_, '_> {
             (
                 self.box_rect(layer.origin),
                 self.transform,
-                self.box_rect(layer.clip),
+                layer.paint_area.unwrap_or_else(|| self.box_rect(layer.clip)),
             )
         };
 
@@ -928,10 +943,16 @@ struct AxisTiling {
 ///
 /// The fill rect is in image pixel coordinates (the drawing transform is
 /// pre-scaled by `ratio`), while translations are in device pixels.
+///
+/// `area_start`/`area_len` is what the repeated fill must cover: the positioning area itself, or
+/// the larger area of a layer that no box clips (`mask-clip: no-clip`).
+#[allow(clippy::too_many_arguments)]
 fn raster_axis_tiling(
     repeat: BackgroundRepeatKeyword,
     origin_start: f64,
     origin_len: f64,
+    area_start: f64,
+    area_len: f64,
     bg_pos: f64,
     tile_len: f64,
     image_len: f64,
@@ -941,10 +962,11 @@ fn raster_axis_tiling(
 
     match repeat {
         Repeat | Round => {
-            let extend_len = extend(bg_pos, tile_len);
+            let _ = origin_len;
+            let extend_len = extend((origin_start - area_start) + bg_pos, tile_len);
             AxisTiling {
-                translate: origin_start - extend_len,
-                rect_len: (origin_len + extend_len) / ratio,
+                translate: area_start - extend_len,
+                rect_len: (area_len + extend_len) / ratio,
                 count: 1,
                 stride: 0.0,
             }

@@ -57,7 +57,7 @@ pub fn hoisted_child_position(tree: &NodeTree, sc_root_id: NodeId, child_id: Nod
         let Some(node) = tree.get(id) else {
             break;
         };
-        let location = node.final_layout().location;
+        let location = node.placed_location();
         let scroll_offset = *node.scroll_offset();
         position.x += location.x - scroll_offset.x as f32;
         position.y += location.y - scroll_offset.y as f32;
@@ -71,10 +71,10 @@ pub fn hoisted_child_position(tree: &NodeTree, sc_root_id: NodeId, child_id: Nod
     let Some(painter) = tree.get(sc_root_id) else {
         return position;
     };
-    let mut painter_position = painter.final_layout().location;
+    let mut painter_position = painter.placed_location();
     let mut current = painter.containing_block();
     while let Some(node) = current.and_then(|id| tree.get(id)) {
-        let location = node.final_layout().location;
+        let location = node.placed_location();
         let scroll_offset = *node.scroll_offset();
         painter_position.x += location.x - scroll_offset.x as f32;
         painter_position.y += location.y - scroll_offset.y as f32;
@@ -168,7 +168,7 @@ impl StackingContext {
         let child_rect = |child: &HoistedPaintChild| -> Option<Rect<f32>> {
             let node = tree.get(child.node_id)?;
             let position = child.position(tree, sc_root_id);
-            let location = node.final_layout().location;
+            let location = node.placed_location();
             let mut overflow = *node.scrollable_overflow();
             if let Some(transform) = node.transform().as_deref() {
                 overflow = transform.transform_rect_bbox(overflow);

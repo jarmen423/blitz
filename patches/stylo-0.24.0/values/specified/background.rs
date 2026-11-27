@@ -209,7 +209,8 @@ pub enum BackgroundClip {
     #[cfg(feature = "gecko")]
     #[value_info(skip)]
     ViewBox,
-    #[cfg(feature = "gecko")]
+    // known-future (wave 2): `mask-clip: no-clip` in Servo mode too (it was Gecko's alone, so the
+    // declaration was dropped and the mask clipped to the border box)
     #[value_info(skip)]
     NoClip,
     // TODO: text and border-area are supposed to combine in backgrounds-4...
@@ -243,7 +244,6 @@ impl BackgroundClip {
             Self::StrokeBox => ClipValidity::MASK,
             #[cfg(feature = "gecko")]
             Self::ViewBox => ClipValidity::MASK,
-            #[cfg(feature = "gecko")]
             Self::NoClip => ClipValidity::MASK,
             Self::Text => ClipValidity::BACKGROUND,
             Self::BorderArea => ClipValidity::BACKGROUND,

@@ -1000,7 +1000,7 @@ pub mod white_space {
     }
 }
 
-#[cfg(feature = "gecko")]
+// (known-future, wave 2: in Servo mode too)
 pub mod _webkit_text_stroke {
     pub use crate::properties::generated::shorthands::_webkit_text_stroke::*;
 
@@ -3682,18 +3682,9 @@ pub mod mask {
                     writer.item(repeat)?;
                 }
 
-                #[cfg(feature = "gecko")]
-                {
-                    if has_origin || (has_clip && *clip != Clip::NoClip) {
-                        writer.item(origin)?;
-                    }
-                }
-
-                #[cfg(feature = "servo")]
-                {
-                    if has_origin || has_clip {
-                        writer.item(origin)?;
-                    }
+                // (known-future, wave 2: `no-clip` is a value in Servo mode too)
+                if has_origin || (has_clip && *clip != Clip::NoClip) {
+                    writer.item(origin)?;
                 }
 
                 if has_clip && *clip != From::from(*origin) {

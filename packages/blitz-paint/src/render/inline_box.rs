@@ -519,10 +519,11 @@ impl<'dom, 'a> ElementCx<'dom, 'a> {
             layout.lines(),
             self.context.dom,
             transform,
-            TextPaintOptions { scale, brush_override: None },
+            TextPaintOptions { scale, brush_override: None, text_mode: self.node.text_mode(), cut: None },
             self.node.id,
             &mut cx,
             Some(filter),
+            &[],
         );
         drop(cx);
         self.context.layer_manager.maybe_pop_layer(scene, pushed);

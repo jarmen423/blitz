@@ -10,7 +10,8 @@ anyrender_skia = { workspace = true }
 anyrender_vello = { workspace = true }
 anyrender_vello_cpu = { workspace = true, features = ["multithreading"] }
 anyrender_vello_hybrid = { workspace = true }
-blitz-dom = { workspace = true, features = ["default", "floats"] }
+# (wave 2) writing-mode: vertical writing modes are laid out and drawn (they were laid out as horizontal text)
+blitz-dom = { workspace = true, features = ["default", "floats", "writing-mode"] }
 blitz-html = { workspace = true }
 blitz-traits = { workspace = true }
 blitz-paint = { workspace = true, features = ["svg"] }

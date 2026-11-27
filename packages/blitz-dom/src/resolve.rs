@@ -147,6 +147,9 @@ impl BaseDocument {
         // Resolve transforms
         let resolve_all = self.flags.contains(DocumentFlags::RESOLVE_ALL_TRANSFORMS);
         self.flags.remove(DocumentFlags::RESOLVE_ALL_TRANSFORMS);
+        // known-future (wave 2): a sticky box that moved (a scroll, a layout change around it)
+        // changes the overflow of the boxes around it
+        let resolve_all = self.resolve_sticky_offsets() || resolve_all;
         self.resolve_transforms(root_node_id, resolve_all);
         timer.record_time("transform");
 
@@ -219,7 +222,7 @@ impl BaseDocument {
                 .unwrap_or(false)
         {
             let node = &self.nodes[node_id];
-            let location = node.final_layout().location.map(|v| v as f64 * scale);
+            let location = node.placed_location().map(|v| v as f64 * scale);
 
             let mut transform = Affine::translate((location.x, location.y));
             if let Some(t) = node.transform().as_deref() {
@@ -230,6 +233,12 @@ impl BaseDocument {
             return transform.transform_rect_bbox(overflow);
         }
 
+        // known-future (wave 2): a sticky box is met here first (a new box is always damaged)
+        if crate::layout::sticky::is_sticky(&self.nodes[node_id]) {
+            self.note_sticky_node(node_id);
+        } else if self.nodes[node_id].sticky_offset.get() != taffy::Point::ZERO {
+            self.nodes[node_id].sticky_offset.set(taffy::Point::ZERO);
+        }
         let transform = self.nodes[node_id].set_transform(scale as f32);
 
         let w = self.nodes[node_id].final_layout().size.width as f64 * scale;
@@ -272,8 +281,8 @@ impl BaseDocument {
         *self.nodes[node_id].scrollable_overflow_mut() = overflow;
         *self.nodes[node_id].layout_children.get_mut() = layout_children;
 
-        let scaled_x = self.nodes[node_id].final_layout().location.x as f64 * scale;
-        let scaled_y = self.nodes[node_id].final_layout().location.y as f64 * scale;
+        let scaled_x = self.nodes[node_id].placed_location().x as f64 * scale;
+        let scaled_y = self.nodes[node_id].placed_location().y as f64 * scale;
 
         let full = if let Some(t) = transform {
             Affine::translate((scaled_x, scaled_y)) * t

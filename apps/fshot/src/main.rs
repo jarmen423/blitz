@@ -19,9 +19,17 @@
 //!   FSHOT_BACKEND=vello-hybrid  (or FSHOT_HYBRID=1) anyrender_vello_hybrid (CPU strips + wgpu GPU raster)
 //!   FSHOT_BACKEND=vello-gpu     (or FSHOT_GPU=1) anyrender_vello (full compute GPU Vello)
 //! Text and images (docs/FIDELITY.md in known-future):
-//!   FSHOT_GEOMETRIC_PRECISION=1 (default) text as Chrome lays out and draws it under text-rendering:
-//!                               geometricPrecision on Linux (no hinting, Blink's ascent/descent rule); 0 = before
+//!   FSHOT_GEOMETRIC_PRECISION=auto (default; wave 2) text as Chrome on Linux lays out and draws it, by each
+//!                               element's own `text-rendering`: under geometricPrecision (which HyperFrames'
+//!                               compiler sets on every element) sub-pixel glyph positions, no hinting and Blink's
+//!                               ascent/descent rule; otherwise Chrome's default there: each glyph's advance width a
+//!                               whole pixel, each glyph drawn at a whole pixel, slight hinting.
+//!                               1 = every element as under geometricPrecision (the default before wave 2);
+//!                               0 = fshot's text before 2026-11-18 (hinted, sub-pixel positions)
 //!   FSHOT_LCD=rgb|bgr           LCD text where it lands on opaque pixels (default off: grayscale everywhere)
+//!   BLITZ_NO_CLIP_MASK=tiles|all (wave 2) where a mask with `mask-clip: no-clip` is applied: `tiles` (default) in the
+//!                               raster tiles its box is in, as Chrome's software rasteriser does (what the box's
+//!                               descendants paint in other tiles is left unmasked); `all`: everywhere
 //!   FSHOT_TEXT_HINT=0|1         override the hinting; FSHOT_IMAGE_QUALITY=low|medium|high for image-rendering:auto
 //! Pages are loaded from disk; their <base href> (which Blitz doesn't apply itself) becomes the base URL.
 //! (wave 1a) No CSS transition runs: a page is painted as it stands, and when `paintset` or `serve` change its CSS or an
@@ -1400,8 +1408,10 @@ fn page_transform(doc: &blitz_dom::BaseDocument, id: NodeId, depth: u32) -> peni
     use peniko::kurbo::{Affine, Vec2};
     let Some(node) = doc.get_node(id) else { return Affine::IDENTITY };
     let l = node.unrounded_layout().location;
+    // (wave 2) a sticky box is painted where its sticky offset puts it
+    let sticky = node.sticky_offset.get();
     let own = node.transform().as_deref().copied().unwrap_or_default();
-    let local = Affine::translate(Vec2::new(l.x as f64, l.y as f64)) * own;
+    let local = Affine::translate(Vec2::new((l.x + sticky.x) as f64, (l.y + sticky.y) as f64)) * own;
     match node.containing_block() {
         Some(p) if depth < 4096 => {
             let (sx, sy) = doc.get_node(p).map(|n| (n.scroll_offset().x, n.scroll_offset().y)).unwrap_or((0.0, 0.0));
@@ -1661,7 +1671,7 @@ fn main() {
     // is the default here (FSHOT_GEOMETRIC_PRECISION=0 gives the text of fshot before 2026-11-18). The real render
     // also draws text LCD on opaque layers; FSHOT_LCD=rgb does that too, but the colour fringes cost about 5 s of
     // NVENC time on a 16.5-minute episode, so it is off by default (docs/FIDELITY.md in known-future).
-    for (k, v) in [("FSHOT_GEOMETRIC_PRECISION", "1")] {
+    for (k, v) in [("FSHOT_GEOMETRIC_PRECISION", "auto")] {
         if std::env::var_os(k).is_none() {
             #[allow(unused_unsafe)]
             unsafe {

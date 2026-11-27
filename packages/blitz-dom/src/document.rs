@@ -218,6 +218,11 @@ pub struct BaseDocument {
     /// known-future: how many extra style and layout passes this resolve is in for container
     /// query sizes that moved (at most 2)
     pub(crate) container_query_passes: u8,
+    /// known-future (wave 2): the `position: sticky` boxes met so far (`layout::sticky`)
+    pub(crate) sticky_nodes: Vec<NodeId>,
+    /// known-future (wave 2): the documents made for CSS references to SVG definitions (`svg_refs`)
+    #[cfg(feature = "svg")]
+    pub(crate) svg_reference_cache: crate::svg_refs::SvgReferenceCache,
     /// How deeply this document is nested within other documents
     /// (0 for a root document). Used to limit `<iframe>` nesting depth.
     pub(crate) subdocument_depth: usize,
@@ -525,6 +530,9 @@ impl BaseDocument {
             style_threading: config.style_threading,
             incremental_layout: config.incremental.unwrap_or(true),
             container_query_passes: 0,
+            sticky_nodes: Vec::new(),
+            #[cfg(feature = "svg")]
+            svg_reference_cache: Default::default(),
             subdocument_depth: config.subdocument_depth,
             devtool_settings: DevtoolSettings::default(),
             url: base_url,
@@ -1459,6 +1467,9 @@ impl BaseDocument {
                     css_face: true,
                     style: overrides.style,
                     width: overrides.width,
+                    // known-future (wave 2): the rule's `unicode-range`, and its place among the rules
+                    unicode_ranges: overrides.unicode_ranges.as_deref(),
+                    css_order: overrides.order,
                     ..Default::default()
                 };
 
@@ -2441,8 +2452,10 @@ impl BaseDocument {
         let mut current = Some(node_id);
         while let Some(id) = current {
             let node = &self.nodes[id];
-            pos.x += node.unrounded_layout().location.x - node.scroll_offset().x as f32;
-            pos.y += node.unrounded_layout().location.y - node.scroll_offset().y as f32;
+            // (known-future, wave 2: a sticky box is where its sticky offset puts it)
+            let sticky = node.sticky_offset.get();
+            pos.x += node.unrounded_layout().location.x + sticky.x - node.scroll_offset().x as f32;
+            pos.y += node.unrounded_layout().location.y + sticky.y - node.scroll_offset().y as f32;
             current = node.containing_block();
         }
         (pos, *self.nodes[node_id].unrounded_layout())
@@ -3769,6 +3782,7 @@ mod font_face_override_tests {
                     weight: Some(800.0),
                     style: Some(parley::fontique::FontStyle::Italic),
                     width: None,
+                    ..Default::default()
                 },
             )),
         };

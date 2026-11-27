@@ -37,6 +37,25 @@ pub struct TextLayout {
     /// `final_layout`. Paint draws text from the unrounded origin so that it keeps its sub-pixel
     /// position while box edges stay snapped. Set by the `writing-mode` layout pass; zero otherwise.
     pub content_box_subpixel_offset: taffy::Point<f32>,
+    /// known-future (wave 2): the lines whose text is cut short and ends with an ellipsis
+    /// (`line-clamp`, `text-overflow: ellipsis`), set by inline layout. The painter cuts them.
+    pub ellipses: Vec<LineEllipsis>,
+}
+
+/// known-future (wave 2): a line of an inline formatting context that ends with an ellipsis: the
+/// last line `line-clamp` leaves, or a line that overflows a box with `text-overflow: ellipsis`.
+/// Layout only says which line and how much room it has; what is left of the line's text is
+/// decided where it is painted, as in Blink, whose line truncator runs on the laid-out line.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LineEllipsis {
+    /// The index of the line
+    pub line: usize,
+    /// How far from the content box's inline-start edge the line's text and its ellipsis may
+    /// reach: the content box's inline size, in the layout's (device) pixels
+    pub max_advance: f32,
+    /// Whether text comes after this line that is not shown (`line-clamp`): the lines after it
+    /// are not painted, and the ellipsis is there even if all of this line's own text fits
+    pub clamped: bool,
 }
 
 impl TextLayout {

@@ -64,6 +64,8 @@ mod stylo;
 mod stylo_to_cursor_icon;
 mod stylo_to_kurbo;
 mod stylo_to_parley;
+#[cfg(feature = "svg")]
+mod svg_refs;
 pub mod traversal;
 /// Versioned storage for the nodes of the DOM tree.
 mod tree;
@@ -75,6 +77,7 @@ pub use resolved_style::{
     css_property_is_supported, parse_transform_matrix, resolved_style_property_names,
 };
 pub use stylo_taffy::CopyStyleGetters;
+pub use stylo_to_parley::text_mode;
 pub use stylo_to_kurbo::resolve_2d_transform;
 
 pub mod net;
@@ -103,6 +106,8 @@ pub use mutator::DocumentMutator;
 pub use node::{Attribute, DocumentData, ElementData, Node, NodeData, TextNodeData};
 pub use parley::FontContext;
 pub use scrolling::{ScrollBehavior, ScrollLogicalPosition};
+#[cfg(feature = "svg")]
+pub use svg_refs::{SvgReference, SvgReferenceKind};
 pub use stylo::UserAgentStylesheet;
 pub use tree::NodeTree;
 

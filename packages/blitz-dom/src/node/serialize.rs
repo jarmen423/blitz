@@ -257,6 +257,23 @@ impl Node {
         output
     }
 
+    /// known-future (wave 2): serializes this SVG subtree as part of a document made for usvg
+    /// (`svg_refs.rs`): as [`Self::svg_source`], but the subtree's own root keeps its `transform`
+    /// attribute (it is not a box with a CSS transform) and declares no namespace (the document
+    /// around it does).
+    #[cfg(feature = "svg")]
+    pub(crate) fn svg_definition_source(&self) -> String {
+        let mut output = String::new();
+        let opts = SerializeOpts {
+            style: OutputStyle::Normal,
+            resolve_current_color: true,
+            declare_xlink_ns: false,
+            skip_root_transform: false,
+        };
+        self.write_outer_html_in_style(&mut output, opts, 0);
+        output
+    }
+
     fn write_outer_html_in_style(&self, writer: &mut String, opts: SerializeOpts, nesting: usize) {
         const INDENT: &str = "  ";
         let style = opts.style;

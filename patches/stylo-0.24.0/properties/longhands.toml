@@ -2517,22 +2517,24 @@ spec = "https://compat.spec.whatwg.org/#the-webkit-text-fill-color"
 servo_restyle_damage = "repaint"
 affects = "paint"
 
+# known-future (wave 2): -webkit-text-stroke-color and -webkit-text-stroke-width (and their shorthand) in Servo mode
+# too: they were Gecko's alone, so `-webkit-text-stroke: 3px #fff` was dropped and outlined text was not drawn
 [-webkit-text-stroke-color]
 type = "Color"
 initial = "computed_value::T::currentcolor()"
 struct = "inherited_text"
-engine = "gecko"
 ignored_when_colors_disabled = true
 spec = "https://compat.spec.whatwg.org/#the-webkit-text-stroke-color"
+servo_restyle_damage = "repaint"
 affects = "paint"
 
 [-webkit-text-stroke-width]
 type = "LineWidth"
 initial = "app_units::Au(0)"
 struct = "inherited_text"
-engine = "gecko"
 spec = "https://compat.spec.whatwg.org/#the-webkit-text-stroke-width"
 animation_type = "discrete"
+servo_restyle_damage = "repaint"
 affects = "overflow"
 
 [forced-color-adjust]

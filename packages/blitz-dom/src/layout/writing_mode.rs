@@ -545,8 +545,10 @@ impl BaseDocument {
         let mut current = Some(node_id);
         while let Some(id) = current {
             let node = &self.nodes[id];
-            pos.x += node.unrounded_layout().location.x - node.scroll_offset().x as f32;
-            pos.y += node.unrounded_layout().location.y - node.scroll_offset().y as f32;
+            // (known-future, wave 2: a sticky box is where its sticky offset puts it)
+            let sticky = node.sticky_offset.get();
+            pos.x += node.unrounded_layout().location.x + sticky.x - node.scroll_offset().x as f32;
+            pos.y += node.unrounded_layout().location.y + sticky.y - node.scroll_offset().y as f32;
             has_vertical |= node.layout_data().writing_mode.is_vertical();
             current = node.containing_block();
         }

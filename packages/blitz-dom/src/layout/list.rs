@@ -85,6 +85,9 @@ fn node_list_item_child(
                 parley_style.font_family = font_family;
             }
 
+            // (known-future, wave 2: by the rules Blink has for the item's `text-rendering`)
+            let _text_mode = parley::TextModeScope::enter(stylo_to_parley::text_mode(&styles));
+
             // Create a parley tree builder
             let mut font_ctx = doc.font_ctx.lock().unwrap();
             let mut builder = doc.layout_ctx.tree_builder(

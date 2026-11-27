@@ -5,6 +5,8 @@ mod clip_path;
 mod form_controls;
 mod inline_box;
 mod mask;
+#[cfg(feature = "svg")]
+mod svg_refs;
 
 use blitz_dom::CopyStyleGetters;
 use std::cell::RefCell;
@@ -15,7 +17,7 @@ use super::kurbo_css::CssBox;
 use crate::blend::convert_blend_mode;
 use crate::color::{Color, ToColorColor};
 use crate::debug_overlay::render_debug_overlay;
-use crate::filters::convert_filters;
+use crate::filters::{convert_filter_list, convert_filters};
 use crate::kurbo_css::NonUniformRoundedRectRadii;
 use crate::layers::LayerManager;
 use crate::sizing::compute_object_fit;
@@ -296,7 +298,8 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
     }
 
     fn node_transform(&self, node: &Node, parent: Affine) -> Affine {
-        let location = node.final_layout().location;
+        // (known-future, wave 2: with the box's sticky offset, if it has one)
+        let location = node.placed_location();
         parent
             * Affine::translate(Vec2::new(location.x as f64, location.y as f64) * self.scale)
             * node.transform().as_deref().copied().unwrap_or_default()
@@ -411,10 +414,13 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                     TextPaintOptions {
                         scale: self.scale,
                         brush_override: Some(Color::BLACK),
+                        text_mode: node.text_mode(),
+                        cut: None,
                     },
                     node.id,
                     &mut self.draw_text_context.borrow_mut(),
                     None,
+                    &layout.ellipses,
                 );
             }
         }
@@ -649,6 +655,13 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
             cx.draw_outset_box_shadow(scene);
         }
 
+        // known-future (wave 2): `clip-path: url(#id)` naming an inline SVG <clipPath> is applied
+        // as an alpha mask over everything the clip-path layer below holds
+        #[cfg(feature = "svg")]
+        let svg_clip = cx.svg_clip_reference();
+        #[cfg(feature = "svg")]
+        cx.push_svg_clip_layer(scene, svg_clip.as_ref());
+
         // clip-path clip ayer
         self.layer_manager.maybe_with_layer(
             scene,
@@ -679,8 +692,34 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                 };
                 // (wave 0) a drop-shadow() with no colour of its own takes the element's `color`
                 let current_color = styles.clone_color();
-                let filter =
-                    convert_filters(&effects.filter.0, filter_region, &current_color).map(Arc::new);
+                // (wave 2) `filter: url(#id)` naming an inline SVG <filter> is part of the graph. Such
+                // a graph is in CSS pixels from the border box's corner, so the layer that carries it
+                // is too (`filter_scale`)
+                let filter_scale = match effects
+                    .filter
+                    .0
+                    .iter()
+                    .any(|f| matches!(f, crate::filters::StyloFilter::Url(_)))
+                {
+                    true => self.scale,
+                    false => 1.0,
+                };
+                #[cfg(feature = "svg")]
+                let filter = convert_filter_list(
+                    &effects.filter.0,
+                    filter_region.scale_from_origin(1.0 / filter_scale),
+                    &current_color,
+                    &|url| cx.svg_filter_reference(url),
+                )
+                .map(Arc::new);
+                #[cfg(not(feature = "svg"))]
+                let filter = convert_filter_list(
+                    &effects.filter.0,
+                    filter_region.scale_from_origin(1.0 / filter_scale),
+                    &current_color,
+                    &|_| None,
+                )
+                .map(Arc::new);
                 let backdrop_filter =
                     convert_filters(&effects.backdrop_filter.0, border_box, &current_color)
                         .map(Arc::new);
@@ -723,8 +762,8 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                     has_opacity || filter.is_some() || backdrop_filter.is_some(),
                     BlendMode::default(),
                     opacity,
-                    cx.transform,
-                    &effect_layer_clip,
+                    cx.transform * Affine::scale(filter_scale),
+                    &effect_layer_clip.scale_from_origin(1.0 / filter_scale),
                     filter,
                     backdrop_filter,
                     |scene| {
@@ -814,6 +853,9 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                 cx.maybe_pop_css_mask_layer(scene, mask_layer_pushed);
             },
         );
+
+        #[cfg(feature = "svg")]
+        cx.pop_svg_clip_layer(scene, svg_clip.as_ref());
 
         self.layer_manager
             .maybe_pop_layer(scene, blend_layer_pushed);
@@ -1099,6 +1141,18 @@ impl ElementCx<'_, '_> {
 
             // Text keeps its unrounded position; only box edges are snapped to whole pixels.
             let subpixel_offset = text_layout.content_box_subpixel_offset;
+            // known-future (wave 2): in a vertical writing mode the lines were laid out as in a
+            // horizontal one, along x and stacked down y (blitz-dom lays each box out in its own
+            // writing mode's axes). They are drawn turned a quarter turn clockwise, so that text
+            // runs down the page with its top to the right (`text-orientation: mixed` for the
+            // scripts that are set sideways; upright vertical glyphs are not drawn as such):
+            // `vertical-rl` stacks the lines from the content box's right edge leftwards, and
+            // `vertical-lr` from its left edge rightwards.
+            let writing_mode = self.style.writing_mode;
+            if writing_mode.is_vertical() {
+                self.draw_vertical_inline_layout(scene, pos, writing_mode.is_vertical_lr());
+                return;
+            }
             let pos = Point {
                 x: pos.x + subpixel_offset.x as f64,
                 y: pos.y + subpixel_offset.y as f64 + text_layout.block_offset as f64,
@@ -1142,10 +1196,77 @@ impl ElementCx<'_, '_> {
                 TextPaintOptions {
                     scale: self.scale,
                     brush_override: None,
+                    text_mode: self.node.text_mode(),
+                    cut: None,
                 },
                 self.node.id,
                 &mut draw_text_context,
                 filter,
+                &text_layout.ellipses,
+            );
+        }
+    }
+
+    /// known-future (wave 2): draw the inline formatting context of a box with a vertical
+    /// writing mode (see `draw_inline_layout`). `pos` is the content box's origin.
+    ///
+    /// A point of the layout at (x along the line, y down the stack of lines) is drawn at
+    /// (the line's right edge less its depth into the line, x): a quarter turn clockwise. With
+    /// `vertical-rl` the stack starts at the content box's right edge, so one turn about that
+    /// edge places every line. With `vertical-lr` the stack starts at the left edge and each
+    /// line is turned about its own right edge.
+    fn draw_vertical_inline_layout(&self, scene: &mut impl PaintScene, pos: Point, left_to_right: bool) {
+        let Some(text_layout) = self.element.inline_layout_data.as_ref() else {
+            return;
+        };
+        let subpixel_offset = text_layout.content_box_subpixel_offset;
+        let scale = self.scale;
+        let origin = Vec2::new(
+            (pos.x + subpixel_offset.x as f64) * scale,
+            (pos.y + subpixel_offset.y as f64) * scale,
+        );
+        let block_offset = text_layout.block_offset as f64 * scale;
+        let content_width = self.frame.content_box().width();
+        // (x, y) -> (edge - y, x)
+        let turned_about = |edge: f64| {
+            self.transform * Affine::translate(origin) * Affine::new([0.0, 1.0, -1.0, 0.0, edge, 0.0])
+        };
+        let options = TextPaintOptions {
+            scale,
+            brush_override: None,
+            text_mode: self.node.text_mode(),
+            cut: None,
+        };
+        let mut draw_text_context = self.context.draw_text_context.borrow_mut();
+        if !left_to_right {
+            let transform = turned_about(content_width - block_offset);
+            self.draw_inline_box_decorations(scene, &text_layout.layout, transform, origin, None);
+            crate::text::stroke_text(
+                scene,
+                text_layout.layout.lines(),
+                self.context.dom,
+                transform,
+                options,
+                self.node.id,
+                &mut draw_text_context,
+                None,
+                &text_layout.ellipses,
+            );
+            return;
+        }
+        for line in text_layout.layout.lines() {
+            let metrics = line.metrics();
+            let edge = block_offset + (metrics.block_min_coord + metrics.block_max_coord) as f64;
+            crate::text::stroke_text(
+                scene,
+                std::iter::once(line),
+                self.context.dom,
+                turned_about(edge),
+                options,
+                self.node.id,
+                &mut draw_text_context,
+                None,
+                &[],
             );
         }
     }
@@ -1215,10 +1336,13 @@ impl ElementCx<'_, '_> {
                 TextPaintOptions {
                     scale: self.scale,
                     brush_override: None,
+                    text_mode: None,
+                    cut: None,
                 },
                 self.node.id,
                 &mut draw_text_context,
                 None,
+                &[],
             );
         }
     }
@@ -1275,10 +1399,13 @@ impl ElementCx<'_, '_> {
                 TextPaintOptions {
                     scale: self.scale,
                     brush_override: None,
+                    text_mode: self.node.text_mode(),
+                    cut: None,
                 },
                 self.node.id,
                 &mut draw_text_context,
                 None,
+                &[],
             );
         }
     }
