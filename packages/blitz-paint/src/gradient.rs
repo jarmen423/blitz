@@ -324,16 +324,16 @@ fn radial_gradient(
                     ShapeExtent::ClosestSide => width_px
                         .min(rect.width() - width_px)
                         .min(height_px.min(rect.height() - height_px)),
-                    ShapeExtent::FarthestCorner => {
-                        (width_px.max(rect.width() - width_px)
-                            + height_px.max(rect.height() - height_px))
-                            * 0.5_f64.sqrt()
-                    }
-                    ShapeExtent::ClosestCorner => {
-                        (width_px.min(rect.width() - width_px)
-                            + height_px.min(rect.height() - height_px))
-                            * 0.5_f64.sqrt()
-                    }
+                    // known-future (wave 1b): a circle sized to a corner has the distance from its centre to
+                    // that corner as its radius (CSS Images 3, 3.2.1). It was `(dx + dy) / sqrt(2)`, which is that
+                    // distance only where dx = dy and less than it everywhere else (`circle at 38% 50%` in a box
+                    // of 520 x 440: 383.5 px for 390.3 px)
+                    ShapeExtent::FarthestCorner => width_px
+                        .max(rect.width() - width_px)
+                        .hypot(height_px.max(rect.height() - height_px)),
+                    ShapeExtent::ClosestCorner => width_px
+                        .min(rect.width() - width_px)
+                        .hypot(height_px.min(rect.height() - height_px)),
                     _ => 0.0,
                 },
                 GenericCircle::Radius(radius) => radius.0.px() as f64,
@@ -1089,5 +1089,118 @@ mod tests {
         let percentage = LengthPercentage::new_percent(Percentage(-0.5));
         assert_eq!(resolve_gradient_length(&length, 300.0), -12.0);
         assert_eq!(resolve_gradient_length(&percentage, 300.0), -150.0);
+    }
+
+    /// the radii of a radial gradient's ending shape and its centre, as `radial_gradient` draws it: `black, transparent`
+    /// with the shape sized by `extent`, centred `at` (fractions of the box) in a box of `size` with its corner at 0, 0
+    fn ending_shape(extent: ShapeExtent, ellipse: bool, at: (f32, f32), size: (f64, f64)) -> ((f64, f64), (f64, f64)) {
+        let shape: EndingShape<NonNegative<CSSPixelLength>, NonNegative<LengthPercentage>> = if ellipse {
+            GenericEndingShape::Ellipse(GenericEllipse::Extent(extent))
+        } else {
+            GenericEndingShape::Circle(GenericCircle::Extent(extent))
+        };
+        let position = GenericPosition {
+            horizontal: LengthPercentage::new_percent(Percentage(at.0)),
+            vertical: LengthPercentage::new_percent(Percentage(at.1)),
+        };
+        let stop = |c| GenericGradientItem::SimpleColorStop(GenericColor::Absolute(c));
+        let items: OwnedSlice<GradientItem<LengthPercentage>> =
+            vec![stop(AbsoluteColor::BLACK), stop(AbsoluteColor::srgb_legacy(0, 0, 0, 0.0))].into();
+        let srgb = ColorInterpolationMethod { space: StyloColorSpace::Srgb, hue: HueInterpolationMethod::Shorter };
+        let rect = Rect::new(0.0, 0.0, size.0, size.1);
+        let (_, transform) =
+            radial_gradient((&shape, &position, &items, GradientFlags::empty()), rect, &AbsoluteColor::BLACK, &srgb);
+        // the gradient is a circle of radius 1 at 0, 0, scaled to the radii and moved to the centre
+        let [rx, skew_y, skew_x, ry, cx, cy] = transform.expect("a shape sized by a keyword has a size").as_coeffs();
+        assert_eq!((skew_y, skew_x), (0.0, 0.0));
+        ((rx, ry), (cx, cy))
+    }
+
+    /// what the radius of a circle sized to a corner was before wave 1b
+    fn corner_radius_before(dx: f64, dy: f64) -> f64 {
+        (dx + dy) * 0.5_f64.sqrt()
+    }
+
+    /// known-future (wave 1b): a circle sized to a corner passes through that corner: its radius is the distance from
+    /// its centre to it, `hypot(dx, dy)` (CSS Images 3, 3.2.1). It was `(dx + dy) / sqrt(2)`: the same where dx = dy,
+    /// too small everywhere else
+    #[test]
+    fn a_circle_to_a_corner_reaches_the_corner() {
+        let radius = |extent, at, size| {
+            let ((rx, ry), _) = ending_shape(extent, false, at, size);
+            assert_eq!(rx, ry, "a circle has one radius");
+            rx
+        };
+        let (farthest, closest) = (ShapeExtent::FarthestCorner, ShapeExtent::ClosestCorner);
+        let near = |got: f64, want: f64| (got - want).abs() < 1e-3;
+
+        // the centre of a square: every corner is as far, and dx = dy, the one case that was right
+        for extent in [farthest, closest] {
+            let r = radius(extent, (0.5, 0.5), (200.0, 200.0));
+            assert_eq!(r, 100.0_f64.hypot(100.0));
+            assert!(near(r, corner_radius_before(100.0, 100.0)), "{r}");
+        }
+
+        // the centre of a box that is not square: every corner is as far, 3-4-5 away
+        for extent in [farthest, closest] {
+            let r = radius(extent, (0.5, 0.5), (400.0, 300.0));
+            assert_eq!(r, 250.0);
+            assert!(r - corner_radius_before(200.0, 150.0) > 2.5, "it was 247.49");
+        }
+
+        // off the centre, in every quarter of a box of 120 x 160: the closest corner is 30 across and 40 down (or up),
+        // the farthest 90 and 120
+        for at in [(0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)] {
+            assert_eq!(radius(closest, at, (120.0, 160.0)), 50.0, "{at:?}");
+            assert_eq!(radius(farthest, at, (120.0, 160.0)), 150.0, "{at:?}");
+        }
+        assert!(near(corner_radius_before(30.0, 40.0), 49.497) && near(corner_radius_before(90.0, 120.0), 148.492));
+
+        // `radial-gradient(circle at 38% 50%, ...)` in a box of 520 x 440 (the mask of Tier-0 page t0_16): the
+        // farthest corner is 322.4 across and 220 down, 390.31 px away; the circle was 383.53 px, so a stop at 32 %
+        // was drawn more than 2 px inside its place
+        let r = radius(farthest, (0.38, 0.5), (520.0, 440.0));
+        assert!(near(r, 322.4_f64.hypot(220.0)) && near(r, 390.310), "{r}");
+        let before = corner_radius_before(322.4, 220.0);
+        assert!(near(before, 383.535) && (r - before) * 0.32 > 2.0, "{before}");
+        let r = radius(closest, (0.38, 0.5), (520.0, 440.0));
+        assert!(near(r, 197.6_f64.hypot(220.0)) && near(r, 295.712), "{r}");
+
+        // a centre outside the box: the closest corner is still the closest, the distances are distances
+        assert_eq!(radius(closest, (-0.25, 0.5), (120.0, 160.0)), 30.0_f64.hypot(80.0));
+        assert_eq!(radius(farthest, (-0.25, 0.5), (120.0, 160.0)), 170.0);
+
+        // a circle sized to a side is as it was: it meets the closest side, or the farthest
+        assert_eq!(radius(ShapeExtent::ClosestSide, (0.25, 0.25), (120.0, 160.0)), 30.0);
+        assert_eq!(radius(ShapeExtent::FarthestSide, (0.25, 0.25), (120.0, 160.0)), 120.0);
+        // and the centre is where it was put
+        assert_eq!(ending_shape(farthest, false, (0.25, 0.75), (120.0, 160.0)).1, (30.0, 120.0));
+    }
+
+    /// an ellipse sized to a corner was already as CSS Images 3 (3.2.1) has it: it passes through the corner, with the
+    /// ratio of its radii the one it has sized to the sides (the distances to the closest, or the farthest, side in
+    /// each direction); both together are those distances times sqrt(2)
+    #[test]
+    fn an_ellipse_to_a_corner_passes_through_it() {
+        let radii = |extent, at, size| ending_shape(extent, true, at, size).0;
+        let pairs = [
+            (ShapeExtent::ClosestCorner, ShapeExtent::ClosestSide, (30.0, 40.0)),
+            (ShapeExtent::FarthestCorner, ShapeExtent::FarthestSide, (90.0, 120.0)),
+        ];
+        for at in [(0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)] {
+            for (corner, side, (dx, dy)) in pairs {
+                // sized to the sides, it meets the side in each direction
+                assert_eq!(radii(side, at, (120.0, 160.0)), (dx, dy), "{at:?}");
+                let (rx, ry) = radii(corner, at, (120.0, 160.0));
+                // the corner (dx, dy from the centre) is on the ellipse ...
+                assert!(((dx / rx).powi(2) + (dy / ry).powi(2) - 1.0).abs() < 1e-12, "{at:?}: {rx} x {ry}");
+                // ... and the ellipse has the shape it has sized to the sides
+                assert!((rx / ry - dx / dy).abs() < 1e-12, "{at:?}: {rx} x {ry}");
+                assert!((rx - dx * 2.0_f64.sqrt()).abs() < 1e-9 && (ry - dy * 2.0_f64.sqrt()).abs() < 1e-9);
+            }
+        }
+        // in the centre of a square the ellipse to a corner is the circle to a corner
+        let (rx, ry) = radii(ShapeExtent::FarthestCorner, (0.5, 0.5), (200.0, 200.0));
+        assert!((rx - 100.0_f64.hypot(100.0)).abs() < 1e-9 && rx == ry, "{rx} x {ry}");
     }
 }
