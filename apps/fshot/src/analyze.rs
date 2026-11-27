@@ -103,21 +103,28 @@ pub(crate) const DEFAULT_USED: &[&str] = &["width", "height", "top", "right", "b
 enum PropKind {
     /// a longhand: Stylo's computed value
     Longhand(LonghandId),
-    /// a custom property (`--name`) or a shorthand: as `getComputedStyle()` gives it
-    Resolved,
+    /// a custom property (`--name`): its computed value, as `getComputedStyle()` gives it
+    Custom,
+    /// a shorthand: as `getComputedStyle()` gives it, from the resolved values of its longhands. Those of
+    /// `margin`, `padding` and `inset` are used values, in px from the layout, and `grid-template` lists the
+    /// tracks the layout made: a shorthand's value is the style's and the layout's.
+    Shorthand,
 }
 
 /// A list of property names a request asks for, each looked up once
 pub(crate) struct Props {
     pub(crate) names: Vec<String>,
     kinds: Vec<PropKind>,
+    /// the places in the list of the shorthands: the values the layout has a say in, which can change on an
+    /// element whose style did not (`Report::element`)
+    pub(crate) laid_out: Vec<usize>,
     /// names the style engine has no property for (a misspelling, or a property this build does not parse)
     pub(crate) unsupported: Vec<String>,
 }
 
 impl Props {
     pub(crate) fn parse<'a>(names: impl IntoIterator<Item = &'a str>) -> Props {
-        let mut props = Props { names: Vec::new(), kinds: Vec::new(), unsupported: Vec::new() };
+        let mut props = Props { names: Vec::new(), kinds: Vec::new(), laid_out: Vec::new(), unsupported: Vec::new() };
         let mut seen: HashSet<String> = HashSet::new();
         for name in names {
             let name = if name.starts_with("--") { name.to_string() } else { name.trim().to_ascii_lowercase() };
@@ -128,7 +135,11 @@ impl Props {
                 Ok(id) => {
                     props.kinds.push(match id.as_shorthand() {
                         Err(PropertyDeclarationId::Longhand(longhand)) => PropKind::Longhand(longhand),
-                        _ => PropKind::Resolved,
+                        Err(PropertyDeclarationId::Custom(_)) => PropKind::Custom,
+                        Ok(_) => {
+                            props.laid_out.push(props.names.len());
+                            PropKind::Shorthand
+                        }
                     });
                     props.names.push(name);
                 }
@@ -151,15 +162,30 @@ impl Props {
     pub(crate) fn value(&self, k: usize, doc: &BaseDocument, id: NodeId, st: &ComputedValues) -> String {
         match &self.kinds[k] {
             PropKind::Longhand(longhand) => st.computed_value_to_string(PropertyDeclarationId::Longhand(*longhand)),
-            PropKind::Resolved => doc.resolved_style_value(id, &self.names[k]),
+            PropKind::Custom | PropKind::Shorthand => doc.resolved_style_value(id, &self.names[k]),
         }
+    }
+
+    /// The values of an element whose computed style is the object `before` was read from, as they are now. What
+    /// the style alone decides is as it was; a shorthand is read again, the layout having a say in it (a sibling
+    /// that grew moves an `auto` margin and leaves the style alone). The list is `before` itself, shared, when
+    /// nothing moved.
+    fn again(&self, doc: &BaseDocument, id: NodeId, before: &Rc<Vec<String>>) -> Rc<Vec<String>> {
+        let mut now: Option<Vec<String>> = None;
+        for &k in &self.laid_out {
+            let value = doc.resolved_style_value(id, &self.names[k]);
+            if value != before[k] {
+                now.get_or_insert_with(|| before.to_vec())[k] = value;
+            }
+        }
+        now.map_or_else(|| Rc::clone(before), Rc::new)
     }
 
     /// The initial value of property `k` (`None` for a custom property or a shorthand, which have none to compare with)
     pub(crate) fn initial(&self, k: usize, initial: &ComputedValues) -> Option<String> {
         match &self.kinds[k] {
             PropKind::Longhand(longhand) => Some(initial.computed_value_to_string(PropertyDeclarationId::Longhand(*longhand))),
-            PropKind::Resolved => None,
+            PropKind::Custom | PropKind::Shorthand => None,
         }
     }
 }
@@ -687,7 +713,8 @@ fn ids(list: &[NodeId]) -> String {
 /// `vars` (custom properties by name), and its boxes
 #[derive(Clone, PartialEq)]
 pub(crate) struct ElementState {
-    /// (shared with the state it was taken from when the element's style is the very same object: see `element`)
+    /// (shared with the state it was taken from when the element's style is the very same object and the layout
+    /// gave no shorthand in the list another value: see `element`)
     pub(crate) cs: Rc<Vec<String>>,
     pub(crate) used: Vec<String>,
     pub(crate) vars: Rc<Vec<String>>,
@@ -713,8 +740,10 @@ impl Report {
     /// `before` is the element as it was taken earlier. When its computed style is still the same object, Stylo
     /// did not restyle it, and its computed values and custom properties are the ones taken then: they are
     /// shared, not serialised again. Its resolved values and boxes are read anew either way (the layout around an
-    /// element moves it and resizes it without touching its style). A state that restyles one element out of a
-    /// thousand is then reported at the cost of that one.
+    /// element moves it and resizes it without touching its style), and so is every shorthand in `props`, whose
+    /// value is made of resolved ones (`Props::again`: an `auto` margin, a padding in per cent, an inset, the
+    /// tracks of a grid). A state that restyles one element out of a thousand is then reported at the cost of
+    /// that one.
     pub(crate) fn element(&self, doc: &BaseDocument, id: NodeId, before: Option<&Taken>) -> Option<Taken> {
         let node = doc.get_node(id)?;
         if !node.is_element() {
@@ -724,7 +753,7 @@ impl Report {
         let b = self.rects.then(|| element_boxes(doc, id, node, &st));
         let rendered = b.as_ref().map_or_else(|| element_boxes(doc, id, node, &st).flags & 1 == 0, |b| b.flags & 1 == 0);
         let (cs, vars) = match before {
-            Some((style, state)) if ServoArc::ptr_eq(style, &st) => (Rc::clone(&state.cs), Rc::clone(&state.vars)),
+            Some((style, state)) if ServoArc::ptr_eq(style, &st) => (self.props.again(doc, id, &state.cs), Rc::clone(&state.vars)),
             _ => (
                 Rc::new((0..self.props.len()).map(|k| self.props.value(k, doc, id, &st)).collect()),
                 Rc::new(self.vars.iter().map(|name| doc.resolved_style_value(id, name)).collect()),

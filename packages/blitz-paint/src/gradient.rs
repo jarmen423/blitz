@@ -861,16 +861,6 @@ mod tests {
     }
 
     fn stops_of(method: ColorInterpolationMethod, colors: &[(AbsoluteColor, Option<f32>)]) -> Vec<(f32, [f32; 4])> {
-        let items: Vec<GradientItem<LengthPercentage>> = colors
-            .iter()
-            .map(|(c, at)| match at {
-                None => GenericGradientItem::SimpleColorStop(GenericColor::Absolute(*c)),
-                Some(p) => GenericGradientItem::ComplexColorStop {
-                    color: GenericColor::Absolute(*c),
-                    position: LengthPercentage::new_percent(Percentage(*p)),
-                },
-            })
-            .collect();
         stops_and_range(method, colors, false, false).0
     }
 

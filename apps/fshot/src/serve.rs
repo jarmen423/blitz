@@ -31,7 +31,11 @@
 //!   open under the name is replaced. Answer: `"doc"`, `"viewport": [W, H]`, `"base_url"`, `"stats": {"nodes",
 //!   "elements", "text", "styled", "stylesheets", "rules"}`, `"refused": [web addresses not fetched]`,
 //!   `"outside": [file addresses outside FSHOT_DOCROOT]`.
-//!   Any command below may carry `"path"` or `"html"` itself: the page is then opened first, as by `open`.
+//!   A command below that works on a page (`reset`, `dump`, `boxes`, `analyze`, `resolve`, `paint`, `frame`,
+//!   `paintset`) may carry `"path"` or `"html"` itself: the page is then opened first, as by `open`, whose answer
+//!   is the command's `"opened"` member. Should the command then fail, the page it opened is not kept: the one
+//!   that was open under the name still is. No other command opens a page, and one that is not known opens none.
+//!   A member that is `null` is a member that is not given, here as everywhere.
 //! * `close`: forget the page (`"all": true`: every page). Answer: `"closed": [names]`.
 //! * `reset`: put the page back as it was loaded, undoing a state `resolve` kept; `"reload": true` builds it
 //!   again from its source instead. Answer: `"reset": true`.
@@ -87,7 +91,10 @@
 //! [folders] | null}`, then for each request `{"seq": N, "req": <the request>}` (`"req_text": "<the line>"` for a
 //! line that was not JSON) and `{"seq": N, "res": <the answer>}`. The file is made anew by each process. No time,
 //! process id or address of the moment is in it, so the same requests give the same file: a test, or a tool in
-//! Python or JavaScript, answers a compiler's questions from the file without running the layout engine. Every
+//! Python or JavaScript, answers a compiler's questions from the file without running the layout engine. A record
+//! is one line to every reader of lines: a request is in the log to the letter, but that a carriage return between
+//! two of its values is written as a space, and U+0085, U+2028 and U+2029 in a string as `\u0085`, `\u2028` and
+//! `\u2029` (the same JSON; Python's `splitlines()` ends a line at each of them). Every
 //! file an answer says was written is named with its size and, while a log is kept (or when a request says
 //! `"digest": true`), its SHA-256 (`"sha256"`), so a replay knows the picture on disk is the one the answer meant.
 //!
@@ -300,10 +307,7 @@ impl Session {
                 let next = match value.as_deref().map(str::trim) {
                     None | Some("") => doc.style_attr_remove_property(&text, property).map(|(text, _)| text),
                     Some(value) => {
-                        let (value, important) = match value.strip_suffix("!important") {
-                            Some(value) => (value.trim_end(), true),
-                            None => (value, false),
-                        };
+                        let (value, important) = split_important(value);
                         doc.style_attr_set_property(&text, property, value, important)
                     }
                 };
@@ -346,24 +350,54 @@ impl Fonts {
         }
     }
 
-    /// The font collection a page starts from (`None`: the document reads the system's fonts itself). The
-    /// environment variable the document's own reading goes by is set for this page either way.
-    fn for_page(&mut self, html: &str) -> Option<blitz_dom::FontContext> {
+    /// The font collection a page starts from: with Chrome's generic families when the page asks for them (or
+    /// the process was started with BLITZ_CHROME_GENERICS=1), as a one-page run of it has them. Which it is, the
+    /// page is told by the collection it is handed and never through the environment: that is the whole
+    /// process's, the runtime's threads run beside this one, and it is not changed under them.
+    fn for_page(&mut self, html: &str) -> blitz_dom::FontContext {
         let chrome = self.always_chrome || page_wants_chrome_generics(html);
-        // (the only thread that reads or writes the environment while a page loads is this one)
-        unsafe {
-            if chrome {
-                std::env::set_var("BLITZ_CHROME_GENERICS", "1");
-            } else {
-                std::env::remove_var("BLITZ_CHROME_GENERICS");
-            }
-        }
+        let read = || blitz_dom::BaseDocument::default_font_context_with_chrome_generics(chrome);
         if self.fresh {
-            return None;
+            return read();
         }
         let slot = if chrome { &mut self.chrome } else { &mut self.plain };
-        Some(slot.get_or_insert_with(blitz_dom::BaseDocument::default_font_context).clone())
+        slot.get_or_insert_with(read).clone()
     }
+}
+
+/// A declaration's value without its `!important`, and whether it had one. CSS reads the word in any case and
+/// with white space between the `!` and it: `!IMPORTANT` and `! important` are `!important`.
+fn split_important(value: &str) -> (&str, bool) {
+    const WORD: &str = "important";
+    let space = |c: char| c.is_ascii_whitespace();
+    let trimmed = value.trim_end_matches(space);
+    if let Some(at) = trimmed.len().checked_sub(WORD.len()).filter(|at| trimmed.is_char_boundary(*at)) {
+        if trimmed[at..].eq_ignore_ascii_case(WORD) {
+            if let Some(rest) = trimmed[..at].trim_end_matches(space).strip_suffix('!') {
+                return (rest.trim_end_matches(space), true);
+            }
+        }
+    }
+    (value, false)
+}
+
+/// A line of JSON as one line to every reader of lines. A carriage return, U+0085, U+2028 and U+2029 end a line
+/// to some of them (Python's `splitlines()`, and its files read as text). In JSON the first is white space between
+/// two values and the others are found only inside a string, so a space and the escapes `\u0085`, `\u2028` and
+/// `\u2029` say the same.
+fn one_line(json: &str) -> std::borrow::Cow<'_, str> {
+    if !json.contains(['\r', '\u{85}', '\u{2028}', '\u{2029}']) {
+        return json.into();
+    }
+    let mut out = String::with_capacity(json.len() + 16);
+    for c in json.chars() {
+        match c {
+            '\r' => out.push(' '),
+            '\u{85}' | '\u{2028}' | '\u{2029}' => write!(out, "\\u{:04x}", c as u32).unwrap(),
+            c => out.push(c),
+        }
+    }
+    out.into()
 }
 
 /// FSHOT_REPLAY_LOG: every request and answer, a line each (the module documentation has the format)
@@ -392,6 +426,7 @@ impl ReplayLog {
     }
 
     fn line(&mut self, line: &str) {
+        let line = one_line(line);
         // (a log that cannot be written is said once on stderr and does not stop the scene)
         if writeln!(self.file, "{line}").and_then(|()| self.file.flush()).is_err() {
             eprintln!("warning: FSHOT_REPLAY_LOG could not be written to");
@@ -502,7 +537,7 @@ impl Server {
 
     fn load_source(&mut self, source: Source) -> Session {
         let fonts = self.fonts.for_page(&source.html);
-        let loaded = load_html(&source.html, source.url.clone(), &source.label, source.viewport.0, source.viewport.1, fonts);
+        let loaded = load_html(&source.html, source.url.clone(), &source.label, source.viewport.0, source.viewport.1, Some(fonts));
         loaded.report();
         Session {
             document: loaded.document,
@@ -539,9 +574,10 @@ impl Server {
                 if let Err(message) = docroot_allows_page(&path) {
                     return fail("docroot", message);
                 }
-                let html = match std::fs::read_to_string(&path) {
+                let html = match read_page(&path) {
                     Ok(html) => html,
-                    Err(e) => return fail("io", format!("{input} cannot be read: {e}")),
+                    Err(PageError::Outside(message)) => return fail("docroot", message),
+                    Err(PageError::Io(e)) => return fail("io", format!("{input} cannot be read: {e}")),
                 };
                 let own = match url::Url::from_file_path(&path) {
                     Ok(url) => url.to_string(),
@@ -937,40 +973,51 @@ impl Server {
         )
     }
 
+    /// Carry a command out: the members of its answer
+    fn command(&mut self, cmd: &str, req: &Value) -> Result<String, Fail> {
+        match cmd {
+            "ping" => Ok(format!("\"pong\":true,\"protocol\":{PROTOCOL},\"backend\":\"skia\"")),
+            "describe" => Ok(Self::describe()),
+            "open" | "load" => self.open(req),
+            "close" => self.close(req),
+            "reset" => self.reset(req),
+            "dump" => self.text_answer(req, "dump"),
+            "boxes" => self.text_answer(req, "boxes"),
+            "analyze" => self.analyze(req),
+            "resolve" => self.resolve(req),
+            "paint" => self.paint(req, false),
+            "frame" => self.paint(req, true),
+            "paintset" => self.paintset(req),
+            "shutdown" => Ok("\"shutdown\":true".to_string()),
+            other => bad(format!("no command \"{other}\": the commands are {}", COMMANDS.join(", "))),
+        }
+    }
+
     /// Carry a request out: the members of its answer, and whether the process ends after it
     fn dispatch(&mut self, req: &Value) -> Result<(String, bool), Fail> {
         if !req.is_object() {
             return bad("a request is a JSON object: {\"id\": ..., \"cmd\": \"...\", ...}");
         }
         let Some(cmd) = get_str(req, "cmd")? else { return bad("a request names its command: \"cmd\"") };
-        // (any command but these may open its page itself)
-        let mut opened = None;
-        if !matches!(cmd, "open" | "load" | "close" | "ping" | "describe" | "shutdown") && (req.get("path").is_some() || req.get("html").is_some()) {
-            opened = Some(self.open(req)?);
+        // A command that works on a page may open that page itself, and only such a command: one that is not
+        // known, or that works on no page, opens nothing (a member that is null is not given).
+        let given = |key: &str| !matches!(req.get(key), None | Some(Value::Null));
+        let opens = matches!(cmd, "reset" | "dump" | "boxes" | "analyze" | "resolve" | "paint" | "frame" | "paintset") && (given("path") || given("html"));
+        if !opens {
+            return self.command(cmd, req).map(|members| (members, cmd == "shutdown"));
         }
-        let members = match cmd {
-            "ping" => format!("\"pong\":true,\"protocol\":{PROTOCOL},\"backend\":\"skia\""),
-            "describe" => Self::describe(),
-            "open" | "load" => self.open(req)?,
-            "close" => self.close(req)?,
-            "reset" => self.reset(req)?,
-            "dump" => self.text_answer(req, "dump")?,
-            "boxes" => self.text_answer(req, "boxes")?,
-            "analyze" => self.analyze(req)?,
-            "resolve" => self.resolve(req)?,
-            "paint" => self.paint(req, false)?,
-            "frame" => self.paint(req, true)?,
-            "paintset" => self.paintset(req)?,
-            "shutdown" => return Ok(("\"shutdown\":true".to_string(), true)),
-            other => return bad(format!("no command \"{other}\": the commands are {}", COMMANDS.join(", "))),
-        };
-        Ok((
-            match opened {
-                Some(opened) => format!("{members},\"opened\":{{{opened}}}"),
-                None => members,
-            },
-            false,
-        ))
+        // A request that fails changes nothing: the page that was open under the name is set aside while the new
+        // one is opened and the command carried out, and is the open one again should either of them fail.
+        let name = Self::doc_name(req)?.to_string();
+        let was = self.sessions.remove(&name);
+        let result = self.open(req).and_then(|opened| self.command(cmd, req).map(|members| format!("{members},\"opened\":{{{opened}}}")));
+        if result.is_err() {
+            self.sessions.remove(&name);
+            if let Some(was) = was {
+                self.sessions.insert(name, was);
+            }
+        }
+        result.map(|members| (members, false))
     }
 
     /// One line in, one line out: the answer, and whether the process ends after it
@@ -1022,6 +1069,42 @@ fn protocol_output() -> File {
         }
         libc::dup2(2, 1);
         File::from_raw_fd(fd)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn important_in_any_case_and_spacing() {
+        for (value, want) in [
+            ("1px !important", ("1px", true)),
+            ("1px!important", ("1px", true)),
+            ("1px !IMPORTANT", ("1px", true)),
+            ("1px ! important", ("1px", true)),
+            ("1px\t!\n Important \t", ("1px", true)),
+            ("!important", ("", true)),
+            ("1px", ("1px", false)),
+            ("1px important", ("1px important", false)),
+            ("1px !importan", ("1px !importan", false)),
+            ("url(a.png?!important)", ("url(a.png?!important)", false)),
+            ("\u{e9}", ("\u{e9}", false)),
+            ("", ("", false)),
+        ] {
+            assert_eq!(split_important(value), want, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn a_log_record_is_one_line() {
+        let plain = "{\"id\":1,\"cmd\":\"ping\"}";
+        assert!(matches!(one_line(plain), std::borrow::Cow::Borrowed(s) if s == plain), "a request is logged to the letter");
+        let raw = "{\"id\":1,\r\"cmd\":\"open\",\r\n \"html\":\"a\u{85}b\u{2028}c\u{2029}d\"}";
+        let line = one_line(raw);
+        assert_eq!(line, "{\"id\":1, \"cmd\":\"open\", \n \"html\":\"a\\u0085b\\u2028c\\u2029d\"}");
+        // (the same JSON)
+        assert_eq!(serde_json::from_str::<Value>(&line).unwrap(), serde_json::from_str::<Value>(raw).unwrap());
     }
 }
 

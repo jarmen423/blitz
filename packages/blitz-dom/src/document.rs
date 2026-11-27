@@ -410,6 +410,16 @@ impl BaseDocument {
     /// once and hands each document a clone ([`DocumentConfig::font_ctx`]): `fshot serve`. A clone holds its own
     /// registered fonts, so one document's `@font-face` fonts are not another's.
     pub fn default_font_context() -> FontContext {
+        Self::default_font_context_with_chrome_generics(chrome_generics_from_env())
+    }
+
+    /// [`default_font_context`](Self::default_font_context) with Chrome's generic families asked for (or not) by
+    /// the caller, whatever BLITZ_CHROME_GENERICS says.
+    ///
+    /// known-future (wave 1a): a process that lays out many documents, some with them and some without, says so
+    /// for each one here. The environment is the whole process's: changing it for one document while other
+    /// threads run is not safe (`fshot serve` did, and no longer does).
+    pub fn default_font_context_with_chrome_generics(chrome: bool) -> FontContext {
         use parley::fontique::{Collection, CollectionOptions, SourceCache};
         let mut font_ctx = FontContext {
             source_cache: SourceCache::new_shared(),
@@ -421,7 +431,9 @@ impl BaseDocument {
         font_ctx
             .collection
             .register_fonts(Blob::new(Arc::new(crate::BULLET_FONT) as _), None);
-        chrome_linux_generics(&mut font_ctx.collection);
+        if chrome {
+            chrome_linux_generics(&mut font_ctx.collection);
+        }
         font_ctx
     }
 
@@ -3827,9 +3839,11 @@ mod change_tracking_tests {
 /// Noto or DejaVu instead. When the Liberation fonts are present, use them as Chrome does (serif, also for cursive and
 /// fantasy, sans-serif, monospace) with BLITZ_CHROME_GENERICS=1 (off by default: HyperFrames fetches the Google
 /// fonts a project names, so in its real render the generics are rarely reached; measured worse on fries without them).
+/// Whether they are asked for is the caller's to say (`default_font_context_with_chrome_generics`): this is not
+/// called when they are not.
 fn chrome_linux_generics(collection: &mut parley::fontique::Collection) {
     use parley::fontique::GenericFamily as G;
-    if !cfg!(target_os = "linux") || !matches!(std::env::var("BLITZ_CHROME_GENERICS").as_deref(), Ok("1")) {
+    if !cfg!(target_os = "linux") {
         return;
     }
     for (generic, name) in [
@@ -3851,4 +3865,10 @@ fn chrome_linux_generics(collection: &mut parley::fontique::Collection) {
     if let Some(id) = first_system_ui {
         collection.set_generic_families_exclusive(G::SystemUi, std::iter::once(id));
     }
+}
+
+/// BLITZ_CHROME_GENERICS=1: a document that is handed no font context resolves the generic families as Chrome does.
+/// (The environment is only read here, never written.)
+fn chrome_generics_from_env() -> bool {
+    matches!(std::env::var("BLITZ_CHROME_GENERICS").as_deref(), Ok("1"))
 }

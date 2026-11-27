@@ -571,10 +571,15 @@ impl Docroot {
     /// path is resolved, checked, opened, and the opened file is checked to be that very path and a regular file
     /// (so nothing that changes on disk between the check and the read is read in its place).
     fn read(&self, url: &url::Url) -> Result<Bytes, DocrootError> {
+        let path = url.to_file_path().map_err(|()| DocrootError { outside: true, message: "not a file path".into() })?;
+        self.read_path(&path)
+    }
+
+    /// `read` for a file named by its path: the page itself is read by this (`read_page`)
+    fn read_path(&self, path: &Path) -> Result<Bytes, DocrootError> {
         use std::io::Read as _;
         let io = |e: std::io::Error| DocrootError { outside: false, message: format!("io error: {e}") };
-        let path = url.to_file_path().map_err(|()| DocrootError { outside: true, message: "not a file path".into() })?;
-        let real = self.resolve(&path)?;
+        let real = self.resolve(path)?;
         let mut file = File::open(&real).map_err(io)?;
         #[cfg(target_os = "linux")]
         {
@@ -598,8 +603,33 @@ impl Docroot {
 /// The page itself is a file read for the page: under FSHOT_DOCROOT it must be inside too.
 fn docroot_allows_page(path: &Path) -> Result<(), String> {
     match Docroot::from_env() {
-        Some(docroot) if !docroot.contains(path) => Err(format!("{} is outside FSHOT_DOCROOT", path.display())),
+        Some(docroot) if !docroot.contains(path) => Err(outside_docroot(path)),
         _ => Ok(()),
+    }
+}
+
+fn outside_docroot(path: &Path) -> String {
+    format!("{} is outside FSHOT_DOCROOT", path.display())
+}
+
+/// Why a page file was not read
+enum PageError {
+    /// it is outside FSHOT_DOCROOT (the sentence says which file)
+    Outside(String),
+    Io(std::io::Error),
+}
+
+/// The text of the page file whose real path is `path`. Under FSHOT_DOCROOT it is read as every other file of a
+/// page is (`Docroot::read_path`): the file that is opened is checked to be the one that was allowed, so a name
+/// that is made to lead elsewhere between the check and the reading (`docroot_allows_page`, then this) is not
+/// followed outside.
+fn read_page(path: &Path) -> Result<String, PageError> {
+    let Some(docroot) = Docroot::from_env() else { return std::fs::read_to_string(path).map_err(PageError::Io) };
+    match docroot.read_path(path) {
+        Ok(bytes) => String::from_utf8(bytes.into())
+            .map_err(|_| PageError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, "stream did not contain valid UTF-8"))),
+        Err(e) if e.outside => Err(PageError::Outside(outside_docroot(path))),
+        Err(e) => Err(PageError::Io(std::io::Error::other(e.message.trim_start_matches("io error: ").to_string()))),
     }
 }
 
@@ -783,14 +813,17 @@ fn load(input: &str, vw: u32, vh: u32) -> HtmlDocument {
     if let Err(message) = docroot_allows_page(&path) {
         backend_error(message);
     }
-    let html = std::fs::read_to_string(&path).unwrap();
-    if page_wants_chrome_generics(&html) {
-        // (read when the document's font collection is made, below; fshot loads one page per process, and `serve`,
-        // which loads many, sets it for each: serve.rs)
-        unsafe { std::env::set_var("BLITZ_CHROME_GENERICS", "1") };
-    }
+    let html = match read_page(&path) {
+        Ok(html) => html,
+        Err(PageError::Outside(message)) => backend_error(message),
+        Err(PageError::Io(e)) => panic!("{input} cannot be read: {e}"),
+    };
+    // A page that asks for Chrome's generic families is handed a font collection that has them (any other makes
+    // its own, which has them with BLITZ_CHROME_GENERICS=1). It is not asked for through the environment: the
+    // runtime's threads are running by now, and the environment is not changed under them (`serve`: serve.rs).
+    let fonts = page_wants_chrome_generics(&html).then(|| blitz_dom::BaseDocument::default_font_context_with_chrome_generics(true));
     let url = page_base_url(&html, || url::Url::from_file_path(&path).unwrap().to_string());
-    let loaded = load_html(&html, url, input, vw, vh, None);
+    let loaded = load_html(&html, url, input, vw, vh, fonts);
     loaded.report();
     loaded.document
 }
@@ -1003,10 +1036,36 @@ struct PaintOrder {
     svg_parts: Vec<(NodeId, String, [f64; 4])>,
 }
 
+/// blitz-paint's logs, on for one paint-order pass, and off again when this goes, however it goes. `serve` catches
+/// a pass that fails and carries on: a log left on would have every later picture painted without the culling of
+/// what is off-screen and logged for nobody. (A lock the failure poisoned is taken, and mended, all the same.)
+struct PaintLog;
+
+impl PaintLog {
+    fn on() -> PaintLog {
+        // (made first: should what follows fail, the logs are put off again)
+        let on = PaintLog;
+        *blitz_paint::PAINT_LOG.lock().unwrap() = Some(Vec::new());
+        blitz_paint::SVG_LOG.lock().unwrap().clear();
+        blitz_paint::SVG_PARTS.lock().unwrap().clear();
+        on
+    }
+}
+
+impl Drop for PaintLog {
+    fn drop(&mut self) {
+        fn put<T>(log: &Mutex<T>, value: T) {
+            *log.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = value;
+            log.clear_poison();
+        }
+        put(&blitz_paint::PAINT_LOG, None);
+        put(&blitz_paint::SVG_LOG, Vec::new());
+        put(&blitz_paint::SVG_PARTS, Vec::new());
+    }
+}
+
 fn paint_order(document: &mut HtmlDocument, painter: &mut Painter) -> PaintOrder {
-    *blitz_paint::PAINT_LOG.lock().unwrap() = Some(Vec::new());
-    blitz_paint::SVG_LOG.lock().unwrap().clear();
-    blitz_paint::SVG_PARTS.lock().unwrap().clear();
+    let _log = PaintLog::on();
     painter.paint_order_pass(document);
     PaintOrder {
         log: blitz_paint::PAINT_LOG.lock().unwrap().take().unwrap(),
@@ -1727,6 +1786,29 @@ mod tests {
         }
         assert!(analyze::Props::parse(analyze::DEFAULT_USED.iter().copied()).unsupported.is_empty());
         assert!(analyze::Props::all().len() > 150);
+        // the shorthands are the values the layout has a say in: read again on an element whose style did not change
+        let mixed = analyze::Props::parse(["opacity", "margin", "--tint", "grid-template", "margin-left", "inset", "padding"]);
+        assert_eq!(mixed.laid_out, [1, 3, 5, 6]);
+        assert!(defaults.laid_out.is_empty() && analyze::Props::all().laid_out.is_empty(), "no shorthand is asked for unasked");
+    }
+
+    #[test]
+    fn the_paint_log_is_off_after_a_pass_that_fails() {
+        let failed = std::panic::catch_unwind(|| {
+            let _log = PaintLog::on();
+            assert!(blitz_paint::PAINT_LOG.lock().unwrap().is_some());
+            blitz_paint::SVG_LOG.lock().unwrap().push((NodeId::from_u64(1), [0.0; 4]));
+            // (the pass fails while it writes to the log, which poisons the log's lock)
+            let _held = blitz_paint::PAINT_LOG.lock().unwrap();
+            panic!("a pass that fails");
+        });
+        assert!(failed.is_err());
+        assert!(!blitz_paint::PAINT_LOG.is_poisoned());
+        assert!(blitz_paint::PAINT_LOG.lock().unwrap().is_none());
+        assert!(blitz_paint::SVG_LOG.lock().unwrap().is_empty());
+        // and a pass after it logs as the first one did
+        drop(PaintLog::on());
+        assert!(blitz_paint::PAINT_LOG.lock().unwrap().is_none());
     }
 
     #[test]
