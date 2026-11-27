@@ -342,3 +342,8 @@ parley_engine = { path = "patches/parley_engine-0.13.0" }
 stylo = { path = "patches/stylo-0.24.0" }
 # known-future (outside round 5): fontique 0.13.0 matching an @font-face font-weight range (400 800) by the whole range
 fontique = { path = "patches/fontique-0.13.0" }
+
+# known-future (wave 2): taffy 0.15.0 (the pinned revision a3997d5) with a preferred aspect ratio applied to the box that
+# `box-sizing` names: a stretched grid item or block with `aspect-ratio` and a border or padding
+[patch."https://github.com/DioxusLabs/taffy"]
+taffy = { path = "patches/taffy-0.15.0" }
