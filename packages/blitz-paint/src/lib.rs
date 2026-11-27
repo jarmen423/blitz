@@ -4,6 +4,7 @@
 #![allow(clippy::collapsible_if)]
 
 mod blend;
+mod blink_stops;
 mod color;
 mod debug_overlay;
 mod filters;

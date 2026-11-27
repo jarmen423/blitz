@@ -1,3 +1,4 @@
+use crate::blink_stops;
 use crate::color::{Color, ToColorColor};
 use color::{ColorSpaceTag, DynamicColor, HueDirection};
 use kurbo::{self, Affine, Point, Rect, Vec2};
@@ -54,38 +55,6 @@ pub(crate) fn to_peniko_gradient(
     scale: f64,
     current_color: &AbsoluteColor,
 ) -> (peniko::Gradient, Option<Affine>) {
-    let (mut peniko_gradient, transform) = match gradient {
-        // https://developer.mozilla.org/en-US/docs/Web/CSS/gradient/linear-gradient
-        GenericGradient::Linear {
-            direction,
-            items,
-            flags,
-            // compat_mode,
-            ..
-        } => linear_gradient(
-            (direction, items, *flags),
-            origin_rect,
-            bounding_box,
-            scale,
-            current_color,
-        ),
-        GenericGradient::Radial {
-            shape,
-            position,
-            items,
-            flags,
-            // compat_mode,
-            ..
-        } => radial_gradient((shape, position, items, *flags), origin_rect, current_color),
-        GenericGradient::Conic {
-            angle,
-            position,
-            items,
-            flags,
-            ..
-        } => conic_gradient((angle, position, items, *flags), origin_rect, current_color),
-    };
-
     // known-future (wave 0): the colour space the stops are interpolated in, and the way round the hue circle,
     // are the gradient's own (CSS Images 4: `linear-gradient(in oklch longer hue, ...)`; when none is written, Stylo
     // has already chosen oklab for a gradient with a stop in a modern colour syntax and srgb for the rest). Every
@@ -104,11 +73,111 @@ pub(crate) fn to_peniko_gradient(
             ..
         } => color_interpolation_method,
     };
+    let (mut peniko_gradient, transform) = match gradient {
+        // https://developer.mozilla.org/en-US/docs/Web/CSS/gradient/linear-gradient
+        GenericGradient::Linear {
+            direction,
+            items,
+            flags,
+            // compat_mode,
+            ..
+        } => linear_gradient(
+            (direction, items, *flags),
+            origin_rect,
+            bounding_box,
+            scale,
+            current_color,
+            method,
+        ),
+        GenericGradient::Radial {
+            shape,
+            position,
+            items,
+            flags,
+            // compat_mode,
+            ..
+        } => radial_gradient((shape, position, items, *flags), origin_rect, current_color, method),
+        GenericGradient::Conic {
+            angle,
+            position,
+            items,
+            flags,
+            ..
+        } => conic_gradient((angle, position, items, *flags), origin_rect, current_color, method),
+    };
+
     let (interpolation_cs, hue_direction) = to_peniko_interpolation(method);
     peniko_gradient.interpolation_cs = interpolation_cs;
     peniko_gradient.hue_direction = hue_direction;
 
+    // known-future (wave 1a): a gradient with no extent is a solid colour, not a shader the rasteriser cannot
+    // make (Skia gives none for a brush transform it cannot invert, and its painter stops the process on that:
+    // `radial-gradient(circle 0px, red, blue)`, an ellipse `closest-side` at a corner of its box, a
+    // `repeating-radial-gradient(circle, red 5px, blue 5px)` ended a scene's paint).
+    if !is_drawable(&peniko_gradient, transform) {
+        return (solid_gradient(&peniko_gradient), None);
+    }
+
     (peniko_gradient, transform)
+}
+
+/// The largest coordinate, radius, angle or matrix coefficient a gradient is handed to the rasteriser with (NaN
+/// and the infinities are not under it either)
+const COORDINATE_LIMIT: f64 = 1e9;
+
+/// Whether a rasteriser can make a shader of the gradient: stops at finite places, a shape with an extent, in
+/// coordinates it can hold, a brush transform that can be inverted.
+fn is_drawable(gradient: &peniko::Gradient, transform: Option<Affine>) -> bool {
+    use peniko::GradientKind;
+    let stops = !gradient.stops.is_empty() && gradient.stops.iter().all(|stop| stop.offset.is_finite());
+    // (a place a rasteriser can hold: its coordinates are `f32`, and a line that ends 1e30 px away is none to it)
+    let place = |p: Point| p.x.abs() < COORDINATE_LIMIT && p.y.abs() < COORDINATE_LIMIT;
+    let size = |v: f32| (v as f64).abs() < COORDINATE_LIMIT;
+    let shape = match gradient.kind {
+        GradientKind::Linear(line) => place(line.start) && place(line.end) && line.start != line.end,
+        GradientKind::Radial(radial) => {
+            place(radial.start_center)
+                && place(radial.end_center)
+                && size(radial.start_radius)
+                && size(radial.end_radius)
+                && radial.start_radius >= 0.0
+                && radial.end_radius > radial.start_radius
+        }
+        GradientKind::Sweep(sweep) => {
+            place(sweep.center)
+                && size(sweep.start_angle)
+                && size(sweep.end_angle)
+                && sweep.start_angle != sweep.end_angle
+        }
+    };
+    // (Skia inverts the matrix in `f32`, and takes a determinant under about 1.5e-11 for none)
+    let invertible = transform.is_none_or(|transform| {
+        let determinant = transform.determinant();
+        transform.as_coeffs().iter().all(|c| c.abs() < COORDINATE_LIMIT)
+            && determinant.is_finite()
+            && determinant.abs() > 1e-9
+    });
+    stops && shape && invertible
+}
+
+/// The solid colour a gradient with no extent is drawn as: the colour of its last stop (CSS Images 3, 3.2.2: a
+/// circle of radius zero or an ellipse of no height is drawn "as if" tiny, so everything is past its last stop;
+/// so is an ellipse of no width when its stops are percentages). A repeating gradient whose stops span nothing
+/// is its last stop's colour too: the specification says the average of its colours, and Chrome 152 draws the
+/// last (`repeating-linear-gradient(90deg, red 5px, blue 5px)` is blue there). No stops at all: transparent.
+fn solid_gradient(gradient: &peniko::Gradient) -> peniko::Gradient {
+    let color = gradient
+        .stops
+        .last()
+        .map(|last| last.color.to_alpha_color::<color::Srgb>().components)
+        .filter(|color| color.iter().all(|c| c.is_finite()))
+        .unwrap_or([0.0; 4]);
+    let color = DynamicColor::from_alpha_color(Color::new(color));
+    // (any shape with an extent will do: every place on it is the one colour)
+    let mut solid = peniko::Gradient::new_linear((0.0, 0.0), (1.0, 0.0));
+    solid.stops.push(ColorStop { color, offset: 0.0 });
+    solid.stops.push(ColorStop { color, offset: 1.0 });
+    solid
 }
 
 /// The `color` crate's names for a CSS `<color-interpolation-method>`.
@@ -149,6 +218,7 @@ fn linear_gradient(
     bounding_box: Rect,
     scale: f64,
     current_color: &AbsoluteColor,
+    method: &ColorInterpolationMethod,
 ) -> (peniko::Gradient, Option<Affine>) {
     let (direction, items, flags) = gradient;
 
@@ -210,8 +280,11 @@ fn linear_gradient(
         gradient_length,
         &mut gradient,
         repeating,
+        method,
+        false,
     );
-    if repeating && gradient.stops.len() > 1 {
+    // (wave 1a: also when the stops of a gradient that does not repeat go before 0 % or past 100 %)
+    if (repeating || (first_offset, last_offset) != (0.0, 1.0)) && gradient.stops.len() > 1 {
         gradient.kind = peniko::GradientKind::Linear(LinearGradientPosition {
             start: start + (end - start) * first_offset as f64,
             end: end + (start - end) * (1.0 - last_offset) as f64,
@@ -225,6 +298,7 @@ fn radial_gradient(
     gradient: RadialGradient,
     rect: Rect,
     current_color: &AbsoluteColor,
+    method: &ColorInterpolationMethod,
 ) -> (peniko::Gradient, Option<Affine>) {
     let (shape, position, items, flags) = gradient;
     let repeating = flags.contains(GradientFlags::REPEATING);
@@ -306,12 +380,29 @@ fn radial_gradient(
                 CSSPixelLength::new(gradient_scale.x as f32),
                 &mut gradient,
                 repeating,
+                method,
+                true,
             );
-            let scale = if repeating && gradient.stops.len() >= 2 {
+            // (wave 1a: also when the stops of a gradient that does not repeat go past 100 %)
+            let ranged =
+                gradient.stops.len() >= 2 && (repeating || (first_offset, last_offset) != (0.0, 1.0));
+            let scale = if ranged {
                 (last_offset - first_offset) as f64
             } else {
                 1.0
             };
+            // known-future (wave 1a): a repeating gradient's first ring is at its first stop, not at the centre
+            // (`repeating-radial-gradient(circle, red 10px, blue 30px)` was drawn 10 px out of phase): the
+            // rings run from the first stop's radius, brought to a radius that is not negative by whole periods
+            if repeating && ranged && first_offset != 0.0 && scale > 0.0 {
+                let start = (first_offset as f64 / scale).rem_euclid(1.0);
+                gradient.kind = peniko::GradientKind::Radial(peniko::RadialGradientPosition {
+                    start_center: Point::ZERO,
+                    start_radius: start as f32,
+                    end_center: Point::ZERO,
+                    end_radius: (start + 1.0) as f32,
+                });
+            }
             Some(
                 Affine::scale_non_uniform(gradient_scale.x * scale, gradient_scale.y * scale)
                     .then_translate(get_translation(position, rect)),
@@ -328,6 +419,7 @@ fn conic_gradient(
     gradient: ConicGradient,
     rect: Rect,
     current_color: &AbsoluteColor,
+    method: &ColorInterpolationMethod,
 ) -> (peniko::Gradient, Option<Affine>) {
     let (angle, position, items, flags) = gradient;
 
@@ -345,8 +437,10 @@ fn conic_gradient(
         CSSPixelLength::new(1.0),
         &mut gradient,
         repeating,
+        method,
     );
-    if repeating && gradient.stops.len() >= 2 {
+    // (wave 1a: also when the stops of a gradient that does not repeat go before 0 % or past 100 %)
+    if (repeating || (first_offset, last_offset) != (0.0, 1.0)) && gradient.stops.len() >= 2 {
         gradient.kind = peniko::GradientKind::Sweep(SweepGradientPosition {
             center: Point::new(0.0, 0.0),
             start_angle: std::f32::consts::PI * 2.0 * first_offset,
@@ -369,6 +463,8 @@ fn resolve_length_color_stops(
     gradient_length: CSSPixelLength,
     gradient: &mut Gradient,
     repeating: bool,
+    method: &ColorInterpolationMethod,
+    clamp_at_zero: bool,
 ) -> (f32, f32) {
     resolve_color_stops(
         current_color,
@@ -376,6 +472,8 @@ fn resolve_length_color_stops(
         gradient_length,
         gradient,
         repeating,
+        method,
+        clamp_at_zero,
         |gradient_length: CSSPixelLength, position: &LengthPercentage| -> Option<f32> {
             position
                 .to_percentage_of(gradient_length)
@@ -391,37 +489,75 @@ fn resolve_color_stops<T>(
     gradient_length: CSSPixelLength,
     gradient: &mut Gradient,
     repeating: bool,
+    method: &ColorInterpolationMethod,
+    clamp_at_zero: bool,
     item_resolver: impl Fn(CSSPixelLength, &T) -> Option<f32>,
 ) -> (f32, f32) {
     let mut hint: Option<f32> = None;
 
-    for (idx, item) in items.iter().enumerate() {
-        let (color, offset) = match item {
-            GenericGradientItem::SimpleColorStop(color) => {
-                let step = 1.0 / (items.len() as f32 - 1.0);
-                (
-                    color.resolve_to_absolute(current_color).as_dynamic_color(),
-                    step * idx as f32,
-                )
-            }
-            GenericGradientItem::ComplexColorStop { color, position } => {
-                let offset = item_resolver(gradient_length, position);
-                if let Some(offset) = offset {
-                    (
-                        color.resolve_to_absolute(current_color).as_dynamic_color(),
-                        offset,
-                    )
-                } else {
-                    continue;
+    // known-future (wave 1a): in a polar interpolation space (hsl, hwb, lch, oklch) Skia is given the stops Blink
+    // gives it, not the colours as written: each converted into the interpolation space and back by Blink's
+    // arithmetic, and one with a missing or powerless component split in two, a colour per neighbour
+    // (blink_stops.rs: which way round two hues 180 degrees apart go, and what a grey stop does to the hue, are
+    // decided there in Chrome). A rectangular space's stops are the colours as written, as before.
+    let prepared = blink_stops::polar_space(method.space).map(|space| {
+        let colors: Vec<AbsoluteColor> = items
+            .iter()
+            .filter_map(|item| match item {
+                GenericGradientItem::SimpleColorStop(color)
+                | GenericGradientItem::ComplexColorStop { color, .. } => {
+                    Some(color.resolve_to_absolute(current_color))
                 }
-            }
+                GenericGradientItem::InterpolationHint(_) => None,
+            })
+            .collect();
+        blink_stops::prepare_stops(&colors, space)
+    });
+    let srgb = |c: [f32; 4]| DynamicColor::from_alpha_color(Color::new(c));
+    // (`longer hue`: Blink adds no stop of its own at 0 or 1, which would be a whole turn of the hue circle
+    // between the added stop and the first one; Skia extends the end stops itself)
+    let pads = !(prepared.is_some() && matches!(method.hue, HueInterpolationMethod::Longer));
+    let mut color_index = 0usize;
+
+    for (idx, item) in items.iter().enumerate() {
+        let stylo_color = match item {
+            GenericGradientItem::SimpleColorStop(color)
+            | GenericGradientItem::ComplexColorStop { color, .. } => color,
             GenericGradientItem::InterpolationHint(position) => {
                 hint = item_resolver(gradient_length, position);
                 continue;
             }
         };
+        let (color, second) = match &prepared {
+            Some((stops, _)) => (
+                srgb(stops[color_index].first),
+                stops[color_index].second.map(srgb),
+            ),
+            None => (
+                stylo_color
+                    .resolve_to_absolute(current_color)
+                    .as_dynamic_color(),
+                None,
+            ),
+        };
+        color_index += 1;
+        let offset = match item {
+            GenericGradientItem::ComplexColorStop { position, .. } => {
+                match item_resolver(gradient_length, position) {
+                    Some(offset) => offset,
+                    None => continue,
+                }
+            }
+            _ => {
+                let step = 1.0 / (items.len() as f32 - 1.0);
+                step * idx as f32
+            }
+        };
 
-        if idx == 0 && !repeating && offset != 0.0 {
+        // (wave 1a: a first stop before 0 % is before the stop this would add, not after it)
+        if idx == 0 && !repeating && offset > 0.0 && pads {
+            // (Blink pads with the first stop as it was written, not as resolved against its neighbour)
+            let color = prepared.as_ref().map_or(color, |(_, front)| srgb(*front));
             gradient
                 .stops
                 .push(peniko::ColorStop { color, offset: 0.0 });
@@ -501,6 +637,24 @@ fn resolve_color_stops<T>(
                 }
             }
         }
+        // (the stop's second colour, at the same place: what follows starts from it)
+        if let (Some(color), Some(offset)) = (second, gradient.stops.last().map(|s| s.offset)) {
+            gradient.stops.push(peniko::ColorStop { color, offset });
+        }
+    }
+
+    // known-future (wave 1a): a repeating gradient whose one period is a hundred boxes long or more
+    // (`repeating-linear-gradient(red, blue calc(infinity * 1px))`), and starts at or before the box and ends at
+    // or after it, shows one period of itself and no second: it is drawn as the gradient that does not repeat,
+    // whose far stops are cut back below (a gradient line a rasteriser has no coordinates for is no gradient)
+    let mut repeating = repeating;
+    if repeating && gradient.stops.len() > 1 {
+        let first_offset = gradient.stops.first().unwrap().offset;
+        let last_offset = gradient.stops.last().unwrap().offset;
+        if !(last_offset - first_offset < FAR_STOP) && first_offset <= 0.0 && last_offset >= 1.0 {
+            repeating = false;
+            gradient.extend = peniko::Extend::Pad;
+        }
     }
 
     // Post-process the stops for repeating gradients
@@ -515,8 +669,10 @@ fn resolve_color_stops<T>(
         }
         (first_offset, last_offset)
     } else {
+        let lo = if clamp_at_zero { 0.0 } else { -FAR_STOP };
+        clip_stops(gradient, lo, 1.0 + FAR_STOP, to_peniko_interpolation(method));
         // Ensure that the gradient ends at offset 1.0
-        if gradient.stops.len() > 1 {
+        if gradient.stops.len() > 1 && pads {
             let last_stop = &gradient.stops.last().unwrap();
             if last_stop.offset < 1.0 {
                 let last_stop = ColorStop {
@@ -526,7 +682,97 @@ fn resolve_color_stops<T>(
                 gradient.stops.push(last_stop);
             }
         }
-        (0.0, 1.0)
+        // known-future (wave 1a): stops before 0 % or past 100 % (`linear-gradient(90deg, red, blue 200%)`,
+        // `red -50%`, a length longer than the gradient line). A rasteriser takes stops from 0 to 1 along its
+        // gradient line and pins the rest to those ends, so such a gradient was squeezed into its box (red to
+        // blue across it, where a browser shows red to half-way purple). As for a repeating gradient, the stops
+        // are spread over 0 to 1 and the caller moves the ends of the gradient line to where the first and the
+        // last of them are.
+        let lo = gradient.stops.iter().map(|s| s.offset).fold(0.0f32, f32::min);
+        let hi = gradient.stops.iter().map(|s| s.offset).fold(1.0f32, f32::max);
+        if gradient.stops.len() > 1 && (lo < 0.0 || hi > 1.0) && lo.is_finite() && hi.is_finite() {
+            for stop in &mut *gradient.stops {
+                stop.offset = (stop.offset - lo) / (hi - lo);
+            }
+            (lo, hi)
+        } else {
+            (0.0, 1.0)
+        }
+    }
+}
+
+/// How far outside its gradient line a stop is left where it is, in lengths of the line. A stop farther out
+/// (`red calc(infinity * 1px)`, a length a million times the box) is cut back to here: spread over 0 to 1 with the
+/// rest, it would leave the stops inside the box no room in an `f32`, and the gradient line's ends no place in
+/// the rasteriser's coordinates. What is seen of a colour change that takes a hundred boxes is under a level.
+const FAR_STOP: f32 = 100.0;
+
+/// known-future (wave 1a): cut a gradient's stops off before `lo` and after `hi` (in lengths of the gradient
+/// line): the gradient starts, or ends, there with the colour it has reached by then (Blink's
+/// `ClampNegativeOffsets`, at both ends). A radial gradient has no radius under zero, so its `lo` is 0; for
+/// the rest the limits are far outside the box (`FAR_STOP`). The colour at a cut is the gradient's own there:
+/// interpolated in its colour space, premultiplied, its hues the way round its hue method says (so a gradient
+/// whose two stops are both a million boxes away still shows, in its box, the mix those two make there).
+/// One limit of that, said once: under `longer hue` the part that is left is again taken the longer way round.
+fn clip_stops(gradient: &mut Gradient, lo: f32, hi: f32, (space, hue): (ColorSpaceTag, HueDirection)) {
+    let outside = |stop: &ColorStop| stop.offset < lo || stop.offset > hi;
+    if !gradient.stops.iter().any(outside) {
+        return;
+    }
+    let mut stops: Vec<ColorStop> = gradient.stops.iter().copied().collect();
+    // the colour of the gradient at `at`, between two stops that are either side of it
+    let mixed = |before: &ColorStop, after: &ColorStop, at: f32| -> ColorStop {
+        let t = if before.offset.is_infinite() {
+            1.0
+        } else if after.offset.is_infinite() {
+            0.0
+        } else {
+            (at - before.offset) / (after.offset - before.offset)
+        };
+        let color = before.color.interpolate(after.color, space, hue).eval(t);
+        ColorStop {
+            color: DynamicColor::from_alpha_color(color.to_alpha_color::<color::Srgb>()),
+            offset: at,
+        }
+    };
+    // the start
+    if stops.first().is_some_and(|first| first.offset < lo) {
+        stops = match stops.iter().position(|stop| stop.offset >= lo) {
+            // every stop is before the start: all there is to see is past the last of them
+            None => {
+                let last = *stops.last().unwrap();
+                vec![ColorStop { offset: lo, ..last }, ColorStop { offset: lo + 1.0, ..last }]
+            }
+            Some(i) => {
+                let mut kept = Vec::with_capacity(stops.len());
+                if stops[i].offset > lo {
+                    kept.push(mixed(&stops[i - 1], &stops[i], lo));
+                }
+                kept.extend_from_slice(&stops[i..]);
+                kept
+            }
+        };
+    }
+    // the end
+    if stops.last().is_some_and(|last| last.offset > hi) {
+        stops = match stops.iter().rposition(|stop| stop.offset <= hi) {
+            // every stop is after the end: all there is to see is before the first of them
+            None => {
+                let first = stops[0];
+                vec![ColorStop { offset: hi - 1.0, ..first }, ColorStop { offset: hi, ..first }]
+            }
+            Some(j) => {
+                let mut kept = stops[..=j].to_vec();
+                if stops[j].offset < hi {
+                    kept.push(mixed(&stops[j], &stops[j + 1], hi));
+                }
+                kept
+            }
+        };
+    }
+    gradient.stops.clear();
+    for stop in stops {
+        gradient.stops.push(stop);
     }
 }
 
@@ -537,6 +783,7 @@ fn resolve_angle_color_stops(
     gradient_length: CSSPixelLength,
     gradient: &mut Gradient,
     repeating: bool,
+    method: &ColorInterpolationMethod,
 ) -> (f32, f32) {
     resolve_color_stops(
         current_color,
@@ -544,6 +791,8 @@ fn resolve_angle_color_stops(
         gradient_length,
         gradient,
         repeating,
+        method,
+        false,
         |_gradient_length: CSSPixelLength, position: &AngleOrPercentage| -> Option<f32> {
             match position {
                 AngleOrPercentage::Angle(angle) => {
@@ -609,6 +858,231 @@ mod tests {
             m(StyloColorSpace::XyzD65, HueInterpolationMethod::Shorter).0,
             ColorSpaceTag::LinearSrgb
         );
+    }
+
+    fn stops_of(method: ColorInterpolationMethod, colors: &[(AbsoluteColor, Option<f32>)]) -> Vec<(f32, [f32; 4])> {
+        let items: Vec<GradientItem<LengthPercentage>> = colors
+            .iter()
+            .map(|(c, at)| match at {
+                None => GenericGradientItem::SimpleColorStop(GenericColor::Absolute(*c)),
+                Some(p) => GenericGradientItem::ComplexColorStop {
+                    color: GenericColor::Absolute(*c),
+                    position: LengthPercentage::new_percent(Percentage(*p)),
+                },
+            })
+            .collect();
+        stops_and_range(method, colors, false, false).0
+    }
+
+    /// the stops as the rasteriser gets them, and where on the gradient line the first and the last of them are
+    #[allow(clippy::type_complexity)]
+    fn stops_and_range(
+        method: ColorInterpolationMethod,
+        colors: &[(AbsoluteColor, Option<f32>)],
+        repeating: bool,
+        radial: bool,
+    ) -> (Vec<(f32, [f32; 4])>, (f32, f32)) {
+        let items: Vec<GradientItem<LengthPercentage>> = colors
+            .iter()
+            .map(|(c, at)| match at {
+                None => GenericGradientItem::SimpleColorStop(GenericColor::Absolute(*c)),
+                Some(p) => GenericGradientItem::ComplexColorStop {
+                    color: GenericColor::Absolute(*c),
+                    position: LengthPercentage::new_percent(Percentage(*p)),
+                },
+            })
+            .collect();
+        let mut gradient = peniko::Gradient::new_linear((0.0, 0.0), (100.0, 0.0));
+        let range = resolve_length_color_stops(&AbsoluteColor::BLACK, &items, CSSPixelLength::new(100.0), &mut gradient, repeating, &method, radial);
+        let stops = gradient.stops.iter().map(|s| (s.offset, s.color.to_alpha_color::<color::Srgb>().components)).collect();
+        (stops, range)
+    }
+
+    /// known-future (wave 1a): stops before 0 % or past 100 % are where they are, not pinned to the ends of the box
+    #[test]
+    fn stops_outside_the_gradient_line() {
+        let srgb = ColorInterpolationMethod { space: StyloColorSpace::Srgb, hue: HueInterpolationMethod::Shorter };
+        let (red, blue) = (AbsoluteColor::srgb_legacy(255, 0, 0, 1.0), AbsoluteColor::srgb_legacy(0, 0, 255, 1.0));
+        let offsets = |stops: &[(f32, [f32; 4])]| stops.iter().map(|s| s.0).collect::<Vec<_>>();
+        // inside 0 to 100 %: as it ever was
+        let (stops, range) = stops_and_range(srgb, &[(red, None), (blue, None)], false, false);
+        assert_eq!((offsets(&stops), range), (vec![0.0, 1.0], (0.0, 1.0)));
+        let (stops, range) = stops_and_range(srgb, &[(red, Some(0.2)), (blue, Some(0.8))], false, false);
+        assert_eq!((offsets(&stops), range), (vec![0.0, 0.2, 0.8, 1.0], (0.0, 1.0)));
+        // red, blue 200%: the line runs to 200 %, with the stops at its ends
+        let (stops, range) = stops_and_range(srgb, &[(red, None), (blue, Some(2.0))], false, false);
+        assert_eq!((offsets(&stops), range), (vec![0.0, 1.0], (0.0, 2.0)));
+        // red -50%, blue 150%: no stop is added at 0 before a stop that is before 0
+        let (stops, range) = stops_and_range(srgb, &[(red, Some(-0.5)), (blue, Some(1.5))], false, false);
+        assert_eq!((offsets(&stops), range), (vec![0.0, 1.0], (-0.5, 1.5)));
+        assert_eq!(stops[0].1, [1.0, 0.0, 0.0, 1.0]);
+        // red -100%, blue 100%: only the start is outside
+        let (stops, range) = stops_and_range(srgb, &[(red, Some(-1.0)), (blue, Some(1.0))], false, false);
+        assert_eq!((offsets(&stops), range), (vec![0.0, 1.0], (-1.0, 1.0)));
+        // red 20%, blue 300%: the stop added at 0 stays at the start of the line
+        let (stops, range) = stops_and_range(srgb, &[(red, Some(0.2)), (blue, Some(3.0))], false, false);
+        assert_eq!(range, (0.0, 3.0));
+        assert!((stops[1].0 - 0.2 / 3.0).abs() < 1e-6 && stops[0].0 == 0.0 && stops[2].0 == 1.0);
+        // a radial gradient starts at its centre with the colour it has reached there
+        let (stops, range) = stops_and_range(srgb, &[(red, Some(-1.0)), (blue, Some(1.0))], false, true);
+        assert_eq!((offsets(&stops), range), (vec![0.0, 1.0], (0.0, 1.0)));
+        assert_eq!(stops[0].1, [0.5, 0.0, 0.5, 1.0]);
+        let (stops, range) = stops_and_range(srgb, &[(red, Some(-2.0)), (blue, Some(-1.0))], false, true);
+        assert_eq!((stops, range), (vec![(0.0, [0.0, 0.0, 1.0, 1.0]), (1.0, [0.0, 0.0, 1.0, 1.0])], (0.0, 1.0)));
+        let (stops, range) = stops_and_range(srgb, &[(red, Some(-0.5)), (blue, Some(3.0))], false, true);
+        assert_eq!((offsets(&stops), range), (vec![0.0, 1.0], (0.0, 3.0)));
+        assert!((stops[0].1[0] - (1.0 - 0.5 / 3.5)).abs() < 1e-6, "{:?}", stops[0].1);
+        // a stop far outside the box is cut back, with the colour the gradient has there: lime 100%, red at infinity
+        // (Stylo keeps the largest length it has for it) stays lime to the eye, and the line stays a line
+        let lime = AbsoluteColor::srgb_legacy(0, 255, 0, 1.0);
+        for far in [f32::INFINITY, f32::MAX, 1e30, 5000.0] {
+            let (stops, range) = stops_and_range(srgb, &[(lime, Some(1.0)), (red, Some(far))], false, false);
+            assert_eq!(range, (0.0, 1.0 + FAR_STOP), "{far}");
+            assert!(stops.iter().all(|s| s.0.is_finite() && (0.0..=1.0).contains(&s.0)), "{far}: {stops:?}");
+            let last = stops.last().unwrap().1;
+            assert!(last[1] > 0.97 && last[0] < 0.03, "{far}: the colour at the cut is {last:?}");
+        }
+        let (stops, range) = stops_and_range(srgb, &[(red, Some(f32::NEG_INFINITY)), (lime, Some(0.0)), (blue, Some(f32::INFINITY))], false, false);
+        assert_eq!(range, (-FAR_STOP, 1.0 + FAR_STOP));
+        assert_eq!(stops.len(), 3);
+        assert!(stops.iter().all(|s| s.0.is_finite() && s.1 == [0.0, 1.0, 0.0, 1.0]), "{stops:?}");
+        // two stops both far away, in oklab: what is seen in the box is the mix oklab makes there, not sRGB's
+        let oklab = ColorInterpolationMethod { space: StyloColorSpace::Oklab, hue: HueInterpolationMethod::Shorter };
+        let (stops, range) = stops_and_range(oklab, &[(red, Some(-50_000.0)), (blue, Some(50_001.0))], false, false);
+        assert_eq!((stops.len(), range), (2, (-FAR_STOP, 1.0 + FAR_STOP)));
+        let seen = |stops: &[(f32, [f32; 4])]| {
+            let (a, b) = (DynamicColor::from_alpha_color(Color::new(stops[0].1)), DynamicColor::from_alpha_color(Color::new(stops[1].1)));
+            a.interpolate(b, ColorSpaceTag::Oklab, HueDirection::Shorter).eval(0.5).to_alpha_color::<color::Srgb>().components
+        };
+        let whole = DynamicColor::from_alpha_color(Color::new([1.0, 0.0, 0.0, 1.0]))
+            .interpolate(DynamicColor::from_alpha_color(Color::new([0.0, 0.0, 1.0, 1.0])), ColorSpaceTag::Oklab, HueDirection::Shorter)
+            .eval(0.5)
+            .to_alpha_color::<color::Srgb>()
+            .components;
+        for (got, want) in seen(&stops).iter().zip(whole) {
+            assert!((got - want).abs() < 2e-3, "{:?} / {whole:?}", seen(&stops));
+        }
+        assert!((whole[0] - 0.5).abs() > 0.02, "oklab's half-way between red and blue is sRGB's: the test shows nothing");
+        // every stop beyond a limit: the colour that is seen
+        let (stops, _) = stops_and_range(srgb, &[(red, Some(500.0)), (blue, Some(600.0))], false, false);
+        assert!(stops.iter().all(|s| s.1 == [1.0, 0.0, 0.0, 1.0]), "{stops:?}");
+        let (stops, _) = stops_and_range(srgb, &[(red, Some(-600.0)), (blue, Some(-500.0))], false, false);
+        assert!(stops.iter().all(|s| s.1 == [0.0, 0.0, 1.0, 1.0]), "{stops:?}");
+        // a repeating gradient with a period no box will see the end of is one period, not repeating
+        let (stops, range) = stops_and_range(srgb, &[(red, None), (blue, Some(f32::INFINITY))], true, false);
+        assert_eq!(range, (0.0, 1.0 + FAR_STOP));
+        assert!(stops.iter().all(|s| s.0.is_finite()) && stops[0].1 == [1.0, 0.0, 0.0, 1.0], "{stops:?}");
+        // repeating gradients are as they were: spread over their own first and last stop
+        let (stops, range) = stops_and_range(srgb, &[(red, Some(0.1)), (blue, Some(0.3))], true, false);
+        assert_eq!(offsets(&stops), vec![0.0, 1.0]);
+        assert!((range.0 - 0.1).abs() < 1e-6 && (range.1 - 0.3).abs() < 1e-6);
+    }
+
+    /// known-future (wave 1a): in a polar space the stops are Blink's (blink_stops.rs); elsewhere the colours as written
+    #[test]
+    fn polar_gradients_get_blinks_stops() {
+        let oklch = |l: f32, c: f32, h: Option<f32>| AbsoluteColor::new(StyloColorSpace::Oklch, l, c, h, 1.0f32);
+        let white = AbsoluteColor::srgb_legacy(255, 255, 255, 1.0);
+        let in_oklch = ColorInterpolationMethod { space: StyloColorSpace::Oklch, hue: HueInterpolationMethod::Shorter };
+        let in_srgb = ColorInterpolationMethod { space: StyloColorSpace::Srgb, hue: HueInterpolationMethod::Shorter };
+        let in_oklab = ColorInterpolationMethod { space: StyloColorSpace::Oklab, hue: HueInterpolationMethod::Shorter };
+
+        // a stop between two others whose hue is missing is two stops at its place, one per neighbour
+        let three = [(oklch(0.7, 0.2, Some(30.0)), None), (oklch(0.5, 0.1, None), None), (oklch(0.7, 0.2, Some(250.0)), None)];
+        let s = stops_of(in_oklch, &three);
+        assert_eq!(s.iter().map(|s| s.0).collect::<Vec<_>>(), [0.0, 0.5, 0.5, 1.0]);
+        assert_ne!(s[1].1, s[2].1);
+        // ... and one colour, hue 0 as written, in a rectangular space
+        assert_eq!(stops_of(in_oklab, &three).len(), 3);
+
+        // white keeps its place but is no longer exactly white in oklch (Blink's conversion: blink_stops.rs)
+        let to_white = [(oklch(0.7, 0.2, Some(30.0)), None), (white, None)];
+        let s = stops_of(in_oklch, &to_white);
+        assert_eq!(s.len(), 2);
+        assert!(s[1].1 != [1.0, 1.0, 1.0, 1.0] && s[1].1.iter().all(|c| (c - 1.0).abs() < 1e-3), "{:?}", s[1].1);
+        // ... and is exactly white where nothing is prepared
+        assert_eq!(stops_of(in_srgb, &to_white)[1].1, [1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(stops_of(in_oklab, &to_white)[1].1, [1.0, 1.0, 1.0, 1.0]);
+    }
+
+    /// known-future (wave 1a): a gradient whose stops do not reach 0 and 1 is extended by a stop at each end, but not
+    /// under `longer hue` in a polar space, where two equal colours are a whole turn of the hue circle apart
+    #[test]
+    fn longer_hue_adds_no_stops_at_the_ends() {
+        let hsl = |h: f32| {
+            let mut c = AbsoluteColor::new(StyloColorSpace::Hsl, h, 90.0f32, 50.0f32, 1.0f32);
+            c.flags.insert(style::color::ColorFlags::IS_LEGACY_SRGB);
+            c
+        };
+        let stops = [(hsl(20.0), Some(0.2)), (hsl(120.0), Some(0.8))];
+        let offsets = |hue| {
+            let method = ColorInterpolationMethod { space: StyloColorSpace::Hsl, hue };
+            stops_of(method, &stops).iter().map(|s| s.0).collect::<Vec<_>>()
+        };
+        assert_eq!(offsets(HueInterpolationMethod::Shorter), [0.0, 0.2, 0.8, 1.0]);
+        assert_eq!(offsets(HueInterpolationMethod::Longer), [0.2, 0.8]);
+        // in a rectangular space the hue method is nothing, and the ends are extended as ever
+        let method = ColorInterpolationMethod { space: StyloColorSpace::Srgb, hue: HueInterpolationMethod::Longer };
+        assert_eq!(stops_of(method, &stops).len(), 4);
+    }
+
+    /// known-future (wave 1a): what the rasteriser cannot make a shader of is drawn as a solid colour
+    #[test]
+    fn a_gradient_with_no_extent_is_a_solid_colour() {
+        let stop = |rgba: [f32; 4], offset: f32| ColorStop { color: DynamicColor::from_alpha_color(Color::new(rgba)), offset };
+        let (red, blue) = ([1.0, 0.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]);
+        let colour = |g: &peniko::Gradient| g.stops.iter().map(|s| s.color.to_alpha_color::<color::Srgb>().components).collect::<Vec<_>>();
+        let mut radial = peniko::Gradient::new_radial((0.0, 0.0), 1.0);
+        radial.stops.push(stop(red, 0.0));
+        radial.stops.push(stop(blue, 1.0));
+        // drawable as it is, and under a transform that keeps an extent in both directions
+        assert!(is_drawable(&radial, None));
+        assert!(is_drawable(&radial, Some(Affine::scale_non_uniform(50.0, 20.0).then_translate(Vec2::new(10.0, 10.0)))));
+        // a circle of radius zero, an ellipse with no width or no height: a transform that cannot be inverted
+        for (sx, sy) in [(0.0, 0.0), (0.0, 20.0), (50.0, 0.0), (f64::NAN, 20.0), (f64::INFINITY, 20.0), (1e-7, 1e-7)] {
+            assert!(!is_drawable(&radial, Some(Affine::scale_non_uniform(sx, sy))), "{sx} x {sy}");
+        }
+        assert_eq!(colour(&solid_gradient(&radial)), [blue, blue], "the last stop's colour");
+        // stops at no place (a gradient line of length zero divides by it)
+        let mut nowhere = radial.clone();
+        nowhere.stops[1].offset = f32::NAN;
+        assert!(!is_drawable(&nowhere, None));
+        nowhere.stops[1].offset = f32::INFINITY;
+        assert!(!is_drawable(&nowhere, None));
+        // a line the rasteriser has no coordinates for
+        let mut far = peniko::Gradient::new_linear((0.0, 0.0), (1e30, 0.0));
+        far.stops.push(stop(red, 0.0));
+        far.stops.push(stop(blue, 1.0));
+        assert!(!is_drawable(&far, None));
+        assert!(!is_drawable(&radial, Some(Affine::scale(1e12))));
+        // a line, and a sweep, with no extent
+        let mut line = peniko::Gradient::new_linear((5.0, 5.0), (5.0, 5.0));
+        line.stops.push(stop(red, 0.0));
+        line.stops.push(stop(blue, 1.0));
+        assert!(!is_drawable(&line, None));
+        let mut sweep = peniko::Gradient::new_sweep((0.0, 0.0), 1.0, 1.0);
+        sweep.stops.push(stop(red, 0.0));
+        sweep.stops.push(stop(blue, 1.0));
+        assert!(!is_drawable(&sweep, None));
+        // repeating: the last stop's colour too (as Chrome draws it)
+        let repeating = line.clone().with_extend(peniko::Extend::Repeat);
+        assert_eq!(colour(&solid_gradient(&repeating)), [blue, blue]);
+        // two radii that are the same radius
+        let mut ring = radial.clone();
+        ring.kind = peniko::GradientKind::Radial(peniko::RadialGradientPosition {
+            start_center: Point::ZERO,
+            start_radius: 0.5,
+            end_center: Point::ZERO,
+            end_radius: 0.5,
+        });
+        assert!(!is_drawable(&ring, None));
+        // no stops at all: transparent, and still something to draw
+        let empty = peniko::Gradient::new_radial((0.0, 0.0), 1.0);
+        assert!(!is_drawable(&empty, None));
+        let solid = solid_gradient(&empty);
+        assert_eq!(colour(&solid), [[0.0; 4]; 2]);
+        assert!(is_drawable(&solid, None));
+        assert!(is_drawable(&solid_gradient(&radial), None));
     }
 
     #[test]
