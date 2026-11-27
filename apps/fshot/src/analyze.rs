@@ -90,9 +90,17 @@ pub(crate) const DEFAULT_PROPS: &[&str] = &[
     "border-top-color",
     "box-shadow",
     "text-shadow",
-    // what moves by itself
+    // what moves by itself: a CSS animation whole (wave 2: its delay, timing function, iteration count,
+    // direction, fill mode and play state too, which decide what a frame shows as much as its name and duration do;
+    // they were given only when asked for by name)
     "animation-name",
     "animation-duration",
+    "animation-delay",
+    "animation-timing-function",
+    "animation-iteration-count",
+    "animation-direction",
+    "animation-fill-mode",
+    "animation-play-state",
     "transition-property",
     "transition-duration",
 ];
