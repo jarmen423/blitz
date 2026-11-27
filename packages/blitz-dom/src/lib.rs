@@ -107,7 +107,7 @@ pub use node::{Attribute, DocumentData, ElementData, Node, NodeData, TextNodeDat
 pub use parley::FontContext;
 pub use scrolling::{ScrollBehavior, ScrollLogicalPosition};
 #[cfg(feature = "svg")]
-pub use svg_refs::{SvgReference, SvgReferenceKind};
+pub use svg_refs::{SvgMaskMode, SvgReference, SvgReferenceKind};
 pub use stylo::UserAgentStylesheet;
 pub use tree::NodeTree;
 

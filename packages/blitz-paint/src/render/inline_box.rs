@@ -118,12 +118,14 @@ fn side(style: BorderStyle, width: &style::values::computed::BorderSideWidth) ->
 impl<'dom, 'a> ElementCx<'dom, 'a> {
     /// Paint the backgrounds and borders of the inline boxes of this inline formatting context
     /// (the inline root's own box is painted as a block), or of those `filter` keeps. `transform`
-    /// maps the layout's coordinates to the scene, and is this element's transform moved by `origin`.
+    /// maps the layout's coordinates to the scene for the line of the given index, and is this
+    /// element's transform moved by `origin` (the same for every line, but in a `vertical-lr` box,
+    /// whose lines are each turned about their own edge: fix round 1).
     pub(super) fn draw_inline_box_decorations(
         &self,
         scene: &mut impl PaintScene,
         layout: &TextLayout<TextBrush>,
-        transform: Affine,
+        transform: impl Fn(usize) -> Affine,
         origin: Vec2,
         filter: Option<RunFilter<'_>>,
     ) {
@@ -377,13 +379,14 @@ impl<'dom, 'a> ElementCx<'dom, 'a> {
                 scale,
                 node: d.node,
                 element,
-                transform: transform * Affine::translate((x0, y0)),
+                transform: transform(f.line) * Affine::translate((x0, y0)),
                 #[cfg(feature = "svg")]
                 svg: None,
                 text_input: None,
                 list_item: None,
                 devtools: self.devtools,
                 custom_widget_scene: None,
+                no_clip_layer: None,
             };
             let faded = self.context.layer_manager.maybe_push_layer(
                 scene,
@@ -512,7 +515,7 @@ impl<'dom, 'a> ElementCx<'dom, 'a> {
             None,
             None,
         );
-        self.draw_inline_box_decorations(scene, layout, transform, origin, Some(filter));
+        self.draw_inline_box_decorations(scene, layout, |_| transform, origin, Some(filter));
         let mut cx = self.context.draw_text_context.borrow_mut();
         crate::text::stroke_text(
             scene,

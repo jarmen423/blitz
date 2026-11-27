@@ -177,28 +177,82 @@ impl BaseDocument {
             _ => None,
         };
         let (port_w, port_h) = (scrollport[2] - scrollport[0], scrollport[3] - scrollport[1]);
-        let mut offset = Point::ZERO;
-        // The far edge first, the near edge after it: both are measured from the unshifted box
-        if let Some(right) = inset(&pos.right, port_w) {
-            let delta = (scrollport[2] - right - (x + w)).min(0.0);
-            let available = (cb_rect[0] - x).min(0.0);
-            offset.x += delta.max(available);
-        }
-        if let Some(left) = inset(&pos.left, port_w) {
-            let delta = (scrollport[0] + left - x).max(0.0);
-            let available = (cb_rect[2] - (x + w)).max(0.0);
-            offset.x += delta.min(available);
-        }
-        if let Some(bottom) = inset(&pos.bottom, port_h) {
-            let delta = (scrollport[3] - bottom - (y + h)).min(0.0);
-            let available = (cb_rect[1] - y).min(0.0);
-            offset.y += delta.max(available);
-        }
-        if let Some(top) = inset(&pos.top, port_h) {
-            let delta = (scrollport[1] + top - y).max(0.0);
-            let available = (cb_rect[3] - (y + h)).max(0.0);
-            offset.y += delta.min(available);
-        }
-        offset
+        let x_shift = sticky_axis_shift(
+            (x, x + w),
+            (scrollport[0], scrollport[2]),
+            (cb_rect[0], cb_rect[2]),
+            inset(&pos.left, port_w),
+            inset(&pos.right, port_w),
+        );
+        let y_shift = sticky_axis_shift(
+            (y, y + h),
+            (scrollport[1], scrollport[3]),
+            (cb_rect[1], cb_rect[3]),
+            inset(&pos.top, port_h),
+            inset(&pos.bottom, port_h),
+        );
+        Point { x: x_shift, y: y_shift }
+    }
+}
+
+/// The shift of a sticky box along one axis (Blink's `ComputeStickyOffset`). `edges` are the
+/// box's start and end in the scroll container's space, `port` the scrollport's, `limits` those
+/// of the containing block's content box less the box's margins; `start` and `end` are the
+/// insets on the two sides (`top` and `bottom`, or `left` and `right`), `None` for `auto`.
+///
+/// The end inset is applied first and the start inset to the box *as that left it*: where the
+/// scrollport is too small for both (`top: 40px; bottom: 40px` on a 50px box in a 100px
+/// scrollport), the start edge then truly has the last word, and the box ends `start` inside
+/// the scrollport however far the end inset had pulled it the other way.
+fn sticky_axis_shift(
+    edges: (f32, f32),
+    port: (f32, f32),
+    limits: (f32, f32),
+    start: Option<f32>,
+    end: Option<f32>,
+) -> f32 {
+    let (mut near, mut far) = edges;
+    if let Some(end) = end {
+        // back towards the start, no further than the containing block lets the box go
+        let delta = (port.1 - end - far).max(limits.0 - near).min(0.0);
+        near += delta;
+        far += delta;
+    }
+    if let Some(start) = start {
+        let delta = (port.0 + start - near).min(limits.1 - far).max(0.0);
+        near += delta;
+    }
+    near - edges.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sticky_axis_shift;
+
+    #[test]
+    fn one_inset_keeps_its_edge_inside_the_scrollport() {
+        // top: 10px on a box scrolled 30px above the scrollport's top
+        assert_eq!(sticky_axis_shift((-30.0, 10.0), (0.0, 100.0), (-30.0, 400.0), Some(10.0), None), 40.0);
+        // bottom: 0 on a box 60px below the scrollport's bottom
+        assert_eq!(sticky_axis_shift((160.0, 200.0), (0.0, 100.0), (0.0, 400.0), None, Some(0.0)), -100.0);
+        // a box already inside does not move
+        assert_eq!(sticky_axis_shift((20.0, 60.0), (0.0, 100.0), (0.0, 400.0), Some(10.0), Some(10.0)), 0.0);
+        // and never leaves its containing block
+        assert_eq!(sticky_axis_shift((-80.0, -40.0), (0.0, 100.0), (-80.0, -20.0), Some(0.0), None), 20.0);
+    }
+
+    #[test]
+    fn opposing_insets_give_the_start_edge_the_last_word() {
+        // audit 1, adv7 #c1: a 50px box at y = 50 in a 100px scrollport, top: 40px; bottom: 40px.
+        // `bottom` pulls it up to 10 (its end 40px inside), then `top` pushes it from there to
+        // 40: a shift of -10. Measured from the unshifted box, `top` asked for nothing and the
+        // box stayed at 10.
+        assert_eq!(sticky_axis_shift((50.0, 100.0), (0.0, 100.0), (0.0, 300.0), Some(40.0), Some(40.0)), -10.0);
+        // #c2: the same box at y = 20: `bottom` moves it up to 10, `top` down to 40
+        assert_eq!(sticky_axis_shift((20.0, 70.0), (0.0, 100.0), (0.0, 300.0), Some(40.0), Some(40.0)), 20.0);
+        // adv4 #sc3: a 60px box at y = 20 in a 102px scrollport, top: 35px; bottom: 35px
+        assert_eq!(sticky_axis_shift((20.0, 80.0), (0.0, 102.0), (20.0, 300.0), Some(35.0), Some(35.0)), 15.0);
+        // the same along x (left and right)
+        assert_eq!(sticky_axis_shift((300.0, 380.0), (0.0, 200.0), (0.0, 700.0), Some(150.0), Some(150.0)), -150.0);
     }
 }

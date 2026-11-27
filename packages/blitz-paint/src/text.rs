@@ -189,8 +189,10 @@ pub(crate) fn stroke_text<'a>(
     // as we ascend). `path_scratch` is a reusable buffer for the run's node path.
     for (line_index, line) in lines.enumerate() {
         // known-future (wave 2): the lines after the one `line-clamp` ends at are not drawn, and
-        // a line that ends with an ellipsis is cut for it
-        if ellipses.iter().any(|e| e.clamped && line_index > e.line) {
+        // a line that ends with an ellipsis is cut for it. (Fix round 1: after a legacy
+        // `-webkit-line-clamp` they are drawn, as Blink draws them: under the box if its
+        // overflow is visible, clipped away with the rest of its overflow if not.)
+        if ellipses.iter().any(|e| e.clamped && e.hides_rest && line_index > e.line) {
             continue;
         }
         let cut = ellipses
@@ -461,6 +463,31 @@ fn snap_glyph(x: f32, y: f32, transform: Affine) -> (f32, f32) {
     (snap(x, a, e), snap(y, d, f))
 }
 
+/// The glyph transform of a synthetic italic: `angle` is the font collection's, in degrees,
+/// clockwise from upright (14 for a face with no italic of its own), and `baseline` the y of
+/// the run's baseline in the run's space.
+///
+/// known-future (wave 2, fix round 1): a scene that applies the transform to each glyph in the
+/// font's space, where y runs up, takes the shear by the angle's tangent (anyrender's Vello
+/// scenes). anyrender's Skia scene applies it to the whole run in the run's own space, where y
+/// runs down the page and the baseline is not at zero: there the same shear leans every letter
+/// backwards (a backslash for a slash) and moves the run sideways by the tangent times its
+/// baseline. For such a scene (`crate::run_space_glyph_transforms`) the shear is the other way
+/// and about the baseline: a point `h` above the baseline moves right by `h` times the tangent,
+/// and a point on it stays where it is.
+fn synthetic_italic(angle: f32, baseline: f32) -> Affine {
+    synthetic_italic_in(angle, baseline, crate::run_space_glyph_transforms())
+}
+
+fn synthetic_italic_in(angle: f32, baseline: f32, run_space: bool) -> Affine {
+    let tan = angle.to_radians().tan() as f64;
+    match run_space {
+        // x' = x + tan * (baseline - y)
+        true => Affine::new([1.0, 0.0, -tan, 1.0, tan * baseline as f64, 0.0]),
+        false => Affine::skew(tan, 0.0),
+    }
+}
+
 /// Synthetic bold on (default; FSHOT_SYNTHETIC_BOLD=0 turns it off).
 fn synthetic_bold_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -499,7 +526,7 @@ pub(crate) fn draw_glyph_run(
     let glyph_xform = run
         .synthesis()
         .skew()
-        .map(|angle| Affine::skew(angle.to_radians().tan() as f64, 0.0));
+        .map(|angle| synthetic_italic(angle, glyph_run.baseline()));
 
     let embolden = if FONT_EMBOLDEN_ENABLED {
         font_embolden(font_size as f64, color, transform)
@@ -591,7 +618,7 @@ pub(crate) fn stroke_glyph_run(
     let glyph_xform = run
         .synthesis()
         .skew()
-        .map(|angle| Affine::skew(angle.to_radians().tan() as f64, 0.0));
+        .map(|angle| synthetic_italic(angle, glyph_run.baseline()));
     let whole_pixel = text_mode == Some(parley::TextMode::WholePixel) && glyph_xform.is_none();
     let hinting = text_hinting(text_mode)
         && (text_mode != Some(parley::TextMode::WholePixel) || font_takes_light_hinting(run.font()));
@@ -654,7 +681,7 @@ fn draw_ellipsis(
     let glyph_xform = run
         .synthesis()
         .skew()
-        .map(|angle| Affine::skew(angle.to_radians().tan() as f64, 0.0));
+        .map(|angle| synthetic_italic(angle, baseline));
     let whole_pixel = text_mode == Some(parley::TextMode::WholePixel) && glyph_xform.is_none();
     let hinting = text_hinting(text_mode)
         && (text_mode != Some(parley::TextMode::WholePixel) || font_takes_light_hinting(run.font()));
@@ -809,6 +836,32 @@ mod tests {
         // a run that is turned keeps its places (Skia positions it by sub-pixels then, too)
         assert_eq!(snap_glyph(10.4, 20.6, Affine::rotate(0.3)), (10.4, 20.6));
         assert_eq!(snap_glyph(10.4, 20.6, Affine::new([0.0, 1.0, -1.0, 0.0, 46.0, 0.0])), (10.4, 20.6));
+    }
+
+    /// Fix round 1 (audit N1): a synthetic italic leans forwards. In a scene that shears the run in
+    /// its own space (y down), what is above the baseline moves right, what is below it moves left
+    /// and the baseline stays put; in one that shears each glyph in the font's space (y up), the
+    /// plain shear does the same.
+    #[test]
+    fn a_synthetic_italic_leans_forwards() {
+        let tan = 14.0f64.to_radians().tan();
+        let run = synthetic_italic_in(14.0, 30.0, true);
+        let on_baseline = run * kurbo::Point::new(100.0, 30.0);
+        assert!((on_baseline.x - 100.0).abs() < 1e-6 && on_baseline.y == 30.0, "{on_baseline:?}");
+        let cap_height = run * kurbo::Point::new(100.0, 10.0);
+        assert!((cap_height.x - (100.0 + 20.0 * tan)).abs() < 1e-4, "above the baseline: to the right ({cap_height:?})");
+        let descender = run * kurbo::Point::new(100.0, 36.0);
+        assert!((descender.x - (100.0 - 6.0 * tan)).abs() < 1e-4, "below it: to the left ({descender:?})");
+        assert!(cap_height.x > on_baseline.x && descender.x < on_baseline.x);
+        // (what it was: the tangent itself in the run's space, which leans backwards and moves the baseline)
+        let was = Affine::skew(tan, 0.0);
+        assert!((was * kurbo::Point::new(100.0, 10.0)).x < (was * kurbo::Point::new(100.0, 30.0)).x);
+        assert!(((was * kurbo::Point::new(100.0, 30.0)).x - 100.0).abs() > 7.0);
+
+        // font space, y up: a point above the baseline has a positive y
+        let glyph = synthetic_italic_in(14.0, 30.0, false);
+        assert!((glyph * kurbo::Point::new(0.0, 20.0)).x > 4.9);
+        assert_eq!(glyph * kurbo::Point::new(5.0, 0.0), kurbo::Point::new(5.0, 0.0));
     }
 
     /// known-future (wave 2): hinting follows the text mode unless FSHOT_TEXT_HINT says otherwise

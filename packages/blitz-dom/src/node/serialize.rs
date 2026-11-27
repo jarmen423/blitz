@@ -22,6 +22,9 @@ struct SerializeOpts {
     declare_xlink_ns: bool,
     /// Leave out the root element's `transform` attribute, which is applied as a CSS transform
     skip_root_transform: bool,
+    /// known-future (wave 2, fix round 1): the `mask-type` to write for one `<mask>` (by node id)
+    /// whatever its own is: the `mask-mode` of the CSS mask layer that names it
+    mask_type: Option<(crate::NodeId, &'static str)>,
 }
 
 impl SerializeOpts {
@@ -31,6 +34,7 @@ impl SerializeOpts {
             resolve_current_color: false,
             declare_xlink_ns: false,
             skip_root_transform: false,
+            mask_type: None,
         }
     }
 }
@@ -129,7 +133,19 @@ fn resolve_vars(value: &str, node: &Node, depth: u8) -> String {
 /// launch-spacex strokes its icons with a rule. A value is written where it is set, not where it is only inherited (the
 /// root `<svg>`'s where it is not the initial value), so usvg's own inheritance, presentation attributes included, still
 /// decides the rest.
-fn svg_rule_paint(node: &Node, el: &crate::node::ElementData, nesting: usize, current_color: Option<&str>) -> String {
+///
+/// (wave 2, fix round 1) So with what a rule says of a mask or a clip path: the `mask-type` of a `<mask>`
+/// (`#m{mask-type:alpha}`), or the one `mask_type` gives it (the `mask-mode` of the CSS mask layer that names it,
+/// which overrides the mask's own), and the `clip-rule` of a shape. Both are declared last, so they are what usvg
+/// reads whatever the element's attribute says.
+fn svg_rule_paint(
+    node: &Node,
+    el: &crate::node::ElementData,
+    nesting: usize,
+    current_color: Option<&str>,
+    mask_type: Option<&'static str>,
+) -> String {
+    use style::computed_values::mask_type::T as MaskType;
     use style::values::computed::{SVGLength, SVGPaint, SVGStrokeDashArray, SVGWidth};
     let Some(st) = node.primary_styles() else {
         return String::new();
@@ -172,6 +188,51 @@ fn svg_rule_paint(node: &Node, el: &crate::node::ElementData, nesting: usize, cu
         out.push(':');
         out.push_str(&value);
         out.push(';');
+    }
+
+    // `clip-rule` is inherited like the properties above, and unlike them it is written where the element's own
+    // attribute disagrees with it too: the attribute is a presentational hint, which any rule overrides
+    let clip_rule = own.clip_rule.to_css_string();
+    let clip_rule_set_here = match &parent {
+        Some(p) => p.get_inherited_svg().clip_rule.to_css_string() != clip_rule,
+        None => clip_rule != "nonzero",
+    };
+    let clip_rule_attr = el
+        .attrs()
+        .iter()
+        .find(|a| a.name.ns == ns!() && &*a.name.local == "clip-rule")
+        .map(|a| a.value.trim().to_ascii_lowercase());
+    let write_clip_rule = match &clip_rule_attr {
+        Some(attr) => *attr != clip_rule,
+        None => clip_rule_set_here,
+    };
+    if write_clip_rule && !in_inline("clip-rule") {
+        out.push_str("clip-rule:");
+        out.push_str(&clip_rule);
+        out.push(';');
+    }
+
+    // `mask-type` is not inherited: a <mask>'s computed value (its attribute, a hint, or a rule's) is the mask's
+    if &*el.name.local == "mask" {
+        let computed = match st.get_svg().mask_type {
+            MaskType::Alpha => "alpha",
+            MaskType::Luminance => "luminance",
+        };
+        let stated = has_attr("mask-type") || in_inline("mask-type");
+        match mask_type {
+            Some(forced) => {
+                out.push_str("mask-type:");
+                out.push_str(forced);
+                out.push(';');
+            }
+            // (the initial value where the source says nothing is usvg's own default)
+            None if computed != "luminance" || stated => {
+                out.push_str("mask-type:");
+                out.push_str(computed);
+                out.push(';');
+            }
+            None => {}
+        }
     }
     out
 }
@@ -252,6 +313,7 @@ impl Node {
             resolve_current_color: true,
             declare_xlink_ns: true,
             skip_root_transform: true,
+            mask_type: None,
         };
         self.write_outer_html_in_style(&mut output, opts, 0);
         output
@@ -261,14 +323,19 @@ impl Node {
     /// (`svg_refs.rs`): as [`Self::svg_source`], but the subtree's own root keeps its `transform`
     /// attribute (it is not a box with a CSS transform) and declares no namespace (the document
     /// around it does).
+    ///
+    /// `mask_type` (fix round 1) names a `<mask>` of the subtree by its node id and the `mask-type`
+    /// it is written with in place of its own: `alpha` or `luminance`, the `mask-mode` of the CSS
+    /// mask layer the document is made for.
     #[cfg(feature = "svg")]
-    pub(crate) fn svg_definition_source(&self) -> String {
+    pub(crate) fn svg_definition_source(&self, mask_type: Option<(crate::NodeId, &'static str)>) -> String {
         let mut output = String::new();
         let opts = SerializeOpts {
             style: OutputStyle::Normal,
             resolve_current_color: true,
             declare_xlink_ns: false,
             skip_root_transform: false,
+            mask_type,
         };
         self.write_outer_html_in_style(&mut output, opts, 0);
         output
@@ -342,7 +409,9 @@ impl Node {
 
                 // (outside round 4) the painting properties rules give this SVG element, for usvg
                 let rule_paint = if opts.resolve_current_color && data.name.ns == ns!(svg) {
-                    svg_rule_paint(self, data, nesting, current_color.as_deref())
+                    // (fix round 1) the `mask-type` a CSS mask layer's `mask-mode` gives this <mask>
+                    let mask_type = opts.mask_type.filter(|(id, _)| *id == self.id).map(|(_, value)| value);
+                    svg_rule_paint(self, data, nesting, current_color.as_deref(), mask_type)
                 } else {
                     String::new()
                 };

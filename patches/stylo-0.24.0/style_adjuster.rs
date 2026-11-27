@@ -186,6 +186,59 @@ impl<'a, 'b: 'a> StyleAdjuster<'a, 'b> {
             .set_adjusted_display(new_display, false);
     }
 
+    /// known-future (wave 2, fix round 1): `display: -webkit-box` and `-webkit-line-clamp` in
+    /// Servo mode, as Blink has them.
+    ///
+    /// `-webkit-line-clamp` clamps the lines of one kind of box only: a `-webkit-box` (or
+    /// `-webkit-inline-box`) whose `-webkit-box-orient` is `vertical`, which is then laid out
+    /// as a block container (the adjustment above, for Gecko). On any other box the legacy
+    /// property does nothing: `display: block; -webkit-line-clamp: 2` shows all its lines. So
+    /// here the legacy clamp of any other box computes to `none`, and layout clamps wherever it
+    /// finds a clamp. (`line-clamp` proper, which is not the legacy property, clamps any block
+    /// container and is left alone.)
+    ///
+    /// A `-webkit-box` that does not clamp is the legacy flexbox, which Blink lays out with its
+    /// flex layout: it computes to `flex` (`inline-flex`), in a column where its orient is
+    /// `vertical`. Either way no computed style keeps `-webkit-box`, and no layout meets one.
+    #[cfg(feature = "servo")]
+    fn adjust_for_webkit_box(&mut self) {
+        use crate::properties::longhands::_moz_box_orient::computed_value::T as BoxOrient;
+        use crate::properties::longhands::flex_direction::computed_value::T as FlexDirection;
+        use crate::values::specified::box_::{DisplayInside, DisplayOutside};
+        let box_style = self.style.get_box();
+        let display = box_style.display;
+        let is_webkit_box = display.inside() == DisplayInside::WebkitBox;
+        let vertical = self.style.get_xul()._moz_box_orient == BoxOrient::Vertical;
+        let (has_clamp, legacy_clamp) = {
+            let clamp = &box_style.line_clamp;
+            (!clamp.is_none(), clamp.webkit_legacy)
+        };
+        let clamps = has_clamp && is_webkit_box && vertical;
+        if has_clamp && legacy_clamp && !clamps {
+            self.style
+                .mutate_box()
+                .set_line_clamp(crate::properties::longhands::line_clamp::get_initial_value());
+        }
+        if !is_webkit_box {
+            return;
+        }
+        let inline = display.outside() == DisplayOutside::Inline;
+        let new_display = match (clamps, inline) {
+            (true, false) => Display::FlowRoot,
+            (true, true) => Display::InlineBlock,
+            (false, false) => Display::Flex,
+            (false, true) => Display::InlineFlex,
+        };
+        self.style
+            .mutate_box()
+            .set_adjusted_display(new_display, false);
+        if !clamps && vertical {
+            self.style
+                .mutate_position()
+                .set_flex_direction(FlexDirection::Column);
+        }
+    }
+
     /// CSS 2.1 section 9.7:
     ///
     ///    If 'position' has the value 'absolute' or 'fixed', [...] the computed
@@ -1075,6 +1128,8 @@ impl<'a, 'b: 'a> StyleAdjuster<'a, 'b> {
         self.blockify_if_necessary(layout_parent_style, element);
         #[cfg(feature = "gecko")]
         self.adjust_for_webkit_line_clamp();
+        #[cfg(feature = "servo")]
+        self.adjust_for_webkit_box();
         self.adjust_for_position();
         self.adjust_for_overflow();
         #[cfg(feature = "gecko")]

@@ -1065,27 +1065,29 @@ impl LayoutPassState<'_> {
         // known-future (wave 2): `line-clamp` (and `-webkit-line-clamp`) and `text-overflow:
         // ellipsis`. A box clamped to N lines is as tall as its first N lines, and its Nth line
         // ends with an ellipsis; a line that overflows a box which clips it ends with one too.
-        // (Blink clamps only a `-webkit-box` with `-webkit-box-orient: vertical`; a box that
-        // sets `-webkit-line-clamp` is taken to be one.)
+        // (Fix round 1: Blink clamps by `-webkit-line-clamp` only a `-webkit-box` with
+        // `-webkit-box-orient: vertical`. The patched Stylo parses both and computes the legacy
+        // clamp of any other box to `none` (`StyleAdjuster::adjust_for_webkit_box`), so a clamp
+        // found here is one that applies. The lines after a legacy clamp are still painted:
+        // `LineEllipsis::hides_rest`.)
         inline_layout.ellipses.clear();
         if has_inline_content {
             use style::values::computed::Overflow;
             use style::values::specified::text::TextOverflowSide;
-            let (clamp, ellipsis_on_overflow) = self.nodes[node_id]
+            let (clamp, legacy_clamp, ellipsis_on_overflow) = self.nodes[node_id]
                 .primary_styles()
                 .map(|s| {
-                    let clamp = s
-                        .get_box()
-                        .line_clamp
+                    let line_clamp = &s.get_box().line_clamp;
+                    let clamp = line_clamp
                         .max_lines
                         .lines_value()
                         .map(|lines| lines.0.max(1) as usize);
                     let clips = s.get_box().overflow_x != Overflow::Visible;
                     let ellipsis =
                         matches!(s.get_text().text_overflow.second, TextOverflowSide::Ellipsis);
-                    (clamp, clips && ellipsis)
+                    (clamp, line_clamp.webkit_legacy, clips && ellipsis)
                 })
-                .unwrap_or((None, false));
+                .unwrap_or((None, false, false));
             let counted_lines = trailing_empty_line.unwrap_or(line_count);
             if let Some(max_lines) = clamp.filter(|max_lines| *max_lines < counted_lines) {
                 if let Some(last) = inline_layout.layout.get(max_lines - 1) {
@@ -1094,6 +1096,7 @@ impl LayoutPassState<'_> {
                         line: max_lines - 1,
                         max_advance: width,
                         clamped: true,
+                        hides_rest: !legacy_clamp,
                     });
                 }
             } else if ellipsis_on_overflow {
@@ -1105,6 +1108,7 @@ impl LayoutPassState<'_> {
                             line: index,
                             max_advance: width,
                             clamped: false,
+                            hides_rest: false,
                         });
                     }
                 }

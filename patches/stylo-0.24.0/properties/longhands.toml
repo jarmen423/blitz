@@ -541,11 +541,12 @@ spec = "https://drafts.fxtf.org/css-masking-1/#propdef-clip-path"
 affects = "paint"
 servo_restyle_damage = "rebuild_stacking_context"
 
+# known-future (wave 2, fix round 1): in Servo mode too (it was Gecko's alone: a rule's `clip-rule` never reached
+# the shapes of a <clipPath>)
 [clip-rule]
 type = "FillRule"
 initial = "Default::default()"
 struct = "inherited_svg"
-engine = "gecko"
 animation_type = "discrete"
 spec = "https://svgwg.org/svg2-draft/masking.html#ClipRuleProperty"
 affects = "paint"
@@ -4281,14 +4282,16 @@ aliases = ["-webkit-box-direction"]
 type = "BoxDirection"
 initial = "computed::BoxDirection::Normal"
 
+# known-future (wave 2, fix round 1): in Servo mode too (it was Gecko's alone). `-webkit-box-orient: vertical` on a
+# `display: -webkit-box` is what makes `-webkit-line-clamp` clamp, in Blink as in Gecko (style_adjuster.rs)
 [-moz-box-orient]
 struct = "xul"
-engine = "gecko"
 spec = "Nonstandard (https://developer.mozilla.org/en-US/docs/Web/CSS/box-orient)"
 animation_type = "discrete"
 affects = "layout"
 gecko_ffi_name = "mBoxOrient"
 aliases = ["-webkit-box-orient"]
+servo_restyle_damage = "rebuild_box"
 type = "BoxOrient"
 initial = "computed::BoxOrient::Horizontal"
 

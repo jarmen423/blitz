@@ -92,10 +92,12 @@ fn is_presentation_attribute(tag: &str, name: &str) -> bool {
         // Only this list maps to CSS; any other attribute that happens to
         // name a CSS property (`padding`, `background`, `rotate` on <text>,
         // `scale` on <feDisplacementMap>) stays a plain attribute. The spec's
-        // other presentation attributes (`clip-rule`, `stop-color`,
+        // other presentation attributes (`stop-color`,
         // `marker-*`, `text-anchor`, ...) name properties Stylo only parses
         // for Gecko, so they are left out until Servo's Stylo supports them.
-        "alignment-baseline" | "baseline-shift" | "clip-path" | "color" | "cursor"
+        // (known-future, wave 2, fix round 1: `clip-rule` is one the patched Stylo parses in
+        // Servo mode too, so that a rule's `clip-rule` reaches a <clipPath>'s shapes)
+        "alignment-baseline" | "baseline-shift" | "clip-path" | "clip-rule" | "color" | "cursor"
         | "direction" | "display" | "fill-opacity" | "fill-rule" | "filter" | "font-family"
         | "font-size" | "font-size-adjust" | "font-stretch" | "font-style" | "font-variant"
         | "font-weight" | "image-rendering" | "letter-spacing" | "mask" | "mask-type"

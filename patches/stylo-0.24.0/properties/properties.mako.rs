@@ -2768,8 +2768,10 @@ macro_rules! longhand_properties_idents {
 // Large pages generate tens of thousands of ComputedValues.
 #[cfg(feature = "gecko")]
 size_of_test!(ComputedValues, 248);
+// (known-future, wave 2, fix round 1: 240, not 232: one more style struct, `XUL`, which holds
+// `-moz-box-orient` (`-webkit-box-orient`) in Servo mode too)
 #[cfg(feature = "servo")]
-size_of_test!(ComputedValues, 232);
+size_of_test!(ComputedValues, 240);
 
 // FFI relies on this.
 size_of_test!(Option<Arc<ComputedValues>>, 8);

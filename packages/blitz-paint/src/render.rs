@@ -2,6 +2,7 @@ mod background;
 mod border;
 mod box_shadow;
 mod clip_path;
+mod compositing;
 mod form_controls;
 mod inline_box;
 mod mask;
@@ -132,6 +133,9 @@ pub struct BlitzDomPainter<'dom, 'a> {
     #[cfg(feature = "scrollbars")]
     pub(crate) scrollbar_drag_target: Option<blitz_dom::node::ScrollbarRef>,
     pub(crate) layer_manager: LayerManager,
+    /// known-future (wave 2, fix round 1): the compositor layers of Chrome's met so far in this
+    /// pass (`render/compositing.rs`): a `mask-clip: no-clip` mask is applied by the layer's tiles
+    pub(crate) compositing: RefCell<compositing::Compositing>,
     /// Reusable scratch allocations shared by all text layouts painted for this document.
     pub(crate) draw_text_context: RefCell<DrawTextContext>,
     /// Cached selection ranges for O(1) lookup: node_id -> (start_offset, end_offset)
@@ -174,6 +178,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
             #[cfg(feature = "scrollbars")]
             scrollbar_drag_target: dom.scrollbar_drag_target(),
             layer_manager,
+            compositing: RefCell::new(compositing::Compositing::default()),
             draw_text_context: RefCell::new(DrawTextContext::default()),
             selection_ranges,
             custom_widget_scenes,
@@ -253,6 +258,9 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         // initial offset already subtracted). Elements outside of this are culled, and
         // scrollports narrow this rectangle further for their descendants.
         let viewport_clip_rect = Rect::new(0.0, 0.0, self.width as f64, self.height as f64);
+
+        // (wave 2, fix round 1) each pass meets Chrome's compositor layers afresh
+        *self.compositing.borrow_mut() = compositing::Compositing::default();
 
         self.render_element(
             scene,
@@ -628,6 +636,32 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
             None,
         );
 
+        // known-future (wave 2, fix round 1): the compositor layer of Chrome's that this element
+        // paints into (`render/compositing.rs`). It is its own where Chrome composites it: for a
+        // reason of its own (then its descendants paint into it too), or, the one case followed
+        // here, a box with a `mask-clip: no-clip` mask that paints over an earlier layer. What
+        // the layer holds is what the box and its descendants paint: its overflow, or its own
+        // box where it clips them.
+        let painted = if should_clip && !adopts_oof { border_box } else { overflow.union(border_box) };
+        let has_no_clip_mask = cx.has_css_mask() && cx.css_mask_has_no_clip();
+        let own_layer = if compositing::has_direct_compositing_reason(&styles) {
+            Some(compositing::CompositedLayer::new(transform, painted))
+        } else if has_no_clip_mask {
+            let layer = compositing::CompositedLayer::new(Affine::IDENTITY, transform.transform_rect_bbox(painted));
+            self.compositing
+                .borrow()
+                .overlaps_earlier_layer(layer.scene_bounds)
+                .then_some(layer)
+        } else {
+            None
+        };
+        if let Some(layer) = own_layer {
+            self.compositing.borrow_mut().open(layer);
+        }
+        if has_no_clip_mask {
+            cx.no_clip_layer = self.compositing.borrow().current();
+        }
+
         // Use the viewport in scene coordinates so outlines, shadows and overflowing
         // descendants are not clipped to the element's border box.
         let blend = convert_blend_mode(effects.mix_blend_mode);
@@ -861,6 +895,11 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
             .maybe_pop_layer(scene, blend_layer_pushed);
         self.layer_manager
             .maybe_pop_layer(scene, css_clip_layer_pushed);
+
+        // (wave 2, fix round 1) what is painted next is outside this element's layer
+        if own_layer.is_some() {
+            self.compositing.borrow_mut().close();
+        }
     }
 
     fn render_node(
@@ -929,6 +968,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
             list_item: element.list_item_data.as_deref(),
             devtools: self.dom.devtools(),
             custom_widget_scene,
+            no_clip_layer: None,
         }
     }
 }
@@ -994,6 +1034,10 @@ struct ElementCx<'dom, 'a> {
     devtools: &'dom DevtoolSettings,
     #[cfg_attr(not(feature = "custom-widget"), expect(unused))]
     custom_widget_scene: Option<&'a Scene>,
+    /// known-future (wave 2, fix round 1): the compositor layer of Chrome's that the element
+    /// paints into where that is not the page's own (`render/compositing.rs`); set for an
+    /// element with a `mask-clip: no-clip` mask, which is applied by that layer's raster tiles
+    no_clip_layer: Option<compositing::CompositedLayer>,
 }
 
 /// Converts parley BoundingBox into peniko Rect
@@ -1170,7 +1214,7 @@ impl ElementCx<'_, '_> {
             self.draw_inline_box_decorations(
                 scene,
                 &text_layout.layout,
-                transform,
+                |_| transform,
                 Vec2::new(pos.x * self.scale, pos.y * self.scale),
                 filter,
             );
@@ -1240,7 +1284,7 @@ impl ElementCx<'_, '_> {
         let mut draw_text_context = self.context.draw_text_context.borrow_mut();
         if !left_to_right {
             let transform = turned_about(content_width - block_offset);
-            self.draw_inline_box_decorations(scene, &text_layout.layout, transform, origin, None);
+            self.draw_inline_box_decorations(scene, &text_layout.layout, |_| transform, origin, None);
             crate::text::stroke_text(
                 scene,
                 text_layout.layout.lines(),
@@ -1254,19 +1298,46 @@ impl ElementCx<'_, '_> {
             );
             return;
         }
-        for line in text_layout.layout.lines() {
-            let metrics = line.metrics();
-            let edge = block_offset + (metrics.block_min_coord + metrics.block_max_coord) as f64;
+        // (Fix round 1: as with `vertical-rl`, the inline boxes' backgrounds and borders are
+        // painted under the text, and a line that ends with an ellipsis is cut for it. Each line
+        // is turned about its own edge, so each is given its own transform, and the one line
+        // `stroke_text` is handed at a time is its line 0.)
+        let edges: Vec<f64> = text_layout
+            .layout
+            .lines()
+            .map(|line| {
+                let metrics = line.metrics();
+                block_offset + (metrics.block_min_coord + metrics.block_max_coord) as f64
+            })
+            .collect();
+        self.draw_inline_box_decorations(
+            scene,
+            &text_layout.layout,
+            |line| turned_about(edges.get(line).copied().unwrap_or(0.0)),
+            origin,
+            None,
+        );
+        let ellipses = &text_layout.ellipses;
+        for (index, line) in text_layout.layout.lines().enumerate() {
+            // the lines after the one `line-clamp` proper ends at are not drawn (`stroke_text`)
+            if ellipses.iter().any(|e| e.clamped && e.hides_rest && index > e.line) {
+                continue;
+            }
+            let own: Vec<blitz_dom::node::LineEllipsis> = ellipses
+                .iter()
+                .filter(|e| e.line == index)
+                .map(|e| blitz_dom::node::LineEllipsis { line: 0, ..*e })
+                .collect();
             crate::text::stroke_text(
                 scene,
                 std::iter::once(line),
                 self.context.dom,
-                turned_about(edge),
+                turned_about(edges[index]),
                 options,
                 self.node.id,
                 &mut draw_text_context,
                 None,
-                &[],
+                &own,
             );
         }
     }

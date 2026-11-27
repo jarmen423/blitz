@@ -37,6 +37,25 @@ pub static SVG_LOG: std::sync::Mutex<Vec<(NodeId, [f64; 4])>> = std::sync::Mutex
 /// GSAP places an SVG part's `transformOrigin` against that box.
 pub static SVG_PARTS: std::sync::Mutex<Vec<(NodeId, String, [f64; 4])>> = std::sync::Mutex::new(Vec::new());
 
+/// known-future (wave 2, fix round 1): whether the scene painted into applies a glyph run's
+/// `glyph_transform` to the run as a whole, in the run's own space (y down the page, about the
+/// run's origin), rather than to each glyph about its own origin in the font's space (y up).
+/// anyrender's Vello scenes do the latter, which is what the transform is documented as;
+/// anyrender's Skia scene concatenates it onto the canvas matrix, the former. A synthetic italic
+/// is written for whichever it is (`text::synthetic_italic`): the same shear leans a letter
+/// forwards in one space and backwards in the other.
+static RUN_SPACE_GLYPH_TRANSFORMS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Say which of the two the scene does (see [`RUN_SPACE_GLYPH_TRANSFORMS`]): `true` for
+/// anyrender's Skia scene. Off until set.
+pub fn set_run_space_glyph_transforms(on: bool) {
+    RUN_SPACE_GLYPH_TRANSFORMS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn run_space_glyph_transforms() -> bool {
+    RUN_SPACE_GLYPH_TRANSFORMS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 const FONT_EMBOLDEN_ENABLED: bool = cfg!(any(
     feature = "font-embolden",
     all(feature = "apple-font-embolden", target_os = "macos"),

@@ -53,9 +53,15 @@ pub struct LineEllipsis {
     /// How far from the content box's inline-start edge the line's text and its ellipsis may
     /// reach: the content box's inline size, in the layout's (device) pixels
     pub max_advance: f32,
-    /// Whether text comes after this line that is not shown (`line-clamp`): the lines after it
-    /// are not painted, and the ellipsis is there even if all of this line's own text fits
+    /// Whether this is the last line `line-clamp` leaves: text comes after it, and the ellipsis
+    /// is there even if all of this line's own text fits
     pub clamped: bool,
+    /// Whether the lines after this one are not painted at all (fix round 1). That is
+    /// `line-clamp` proper. The legacy `-webkit-line-clamp` only makes the box as tall as its
+    /// first lines: Blink lays the rest out below them, where they show unless the box's
+    /// `overflow` clips them (`overflow: visible` shows them under the box, and a box that
+    /// clips shows what reaches into its padding).
+    pub hides_rest: bool,
 }
 
 impl TextLayout {

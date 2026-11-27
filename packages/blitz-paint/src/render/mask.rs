@@ -35,6 +35,13 @@
 //! else: a 240px-wide box at x=480 with a child overflowing it to x=790 is masked up to x=763
 //! (the tile edge) and unmasked from there on. `BLITZ_NO_CLIP_MASK=all` gives the mask of the
 //! specification instead (everywhere), `BLITZ_NO_CLIP_MASK=tiles` (the default) Chrome's.
+//!
+//! The tiles are those of the compositor layer the element paints into (fix round 1). That is
+//! the page's own layer, whose tiles start at the picture's corner, unless Chrome composites the
+//! element or an ancestor of it (`compositing.rs`: `will-change: transform`, a 3D transform, or
+//! painting over an earlier layer): the layer is then as large as what it holds and its tiles
+//! start at its own corner, in its own space, so a layer under 512 pixels each way is a single
+//! tile and the mask covers everything the element paints.
 use crate::render::background::get_cyclic;
 
 use super::background::ImageLayerStyles;
@@ -65,19 +72,32 @@ impl ElementCx<'_, '_> {
 
     /// Whether any mask image layer has `mask-clip: no-clip`: the mask is then not held to the
     /// border box (see the module documentation)
-    fn css_mask_has_no_clip(&self) -> bool {
+    pub(super) fn css_mask_has_no_clip(&self) -> bool {
         let svg_styles = self.style.get_svg();
         (0..svg_styles.mask_image.0.len()).any(|idx| self.mask_layer_has_no_clip(idx))
     }
 
-    /// Where a mask with a `no-clip` layer is applied, in the scene's (device) space
-    fn no_clip_mask_region(&self) -> Rect {
-        let device_box = self.transform.transform_rect_bbox(self.frame.border_box);
-        no_clip_mask_region(
-            device_box,
+    /// Where a mask with a `no-clip` layer is applied: a rectangle, and the transform to the
+    /// scene's (device) space from the space the rectangle is in. That space is the scene's for
+    /// an element that paints into the page's own layer, and the layer's own for one that Chrome
+    /// composites (`compositing.rs`): the raster tiles are the layer's.
+    fn no_clip_mask_region(&self) -> (Affine, Rect) {
+        let picture = (
             (self.context.initial_x, self.context.initial_y),
             (self.context.width as f64, self.context.height as f64),
-        )
+        );
+        let Some(layer) = self.no_clip_layer.filter(|layer| layer.to_scene.determinant().abs() > 1e-12) else {
+            let device_box = self.transform.transform_rect_bbox(self.frame.border_box);
+            return (Affine::IDENTITY, no_clip_mask_region(device_box, picture.0, picture.1));
+        };
+        // The border box in the layer's space, among the layer's tiles
+        let layer_box = (layer.to_scene.inverse() * self.transform).transform_rect_bbox(self.frame.border_box);
+        let region = no_clip_mask_region(
+            layer_box,
+            (layer.bounds.x0, layer.bounds.y0),
+            (layer.bounds.width(), layer.bounds.height()),
+        );
+        (layer.to_scene, region)
     }
 
     /// If the element has a CSS mask, push an isolation layer for the masked content
@@ -127,19 +147,19 @@ impl ElementCx<'_, '_> {
         if self.css_mask_has_no_clip() {
             // The mask is an alpha mask applied over the region alone: outside it the content
             // stays as painted (known-future, wave 2; the module documentation)
-            let region = self.no_clip_mask_region();
+            let (region_to_scene, region) = self.no_clip_mask_region();
             scene.push_layer(
                 Fill::NonZero,
                 BlendMode::new(Mix::Normal, Compose::DestIn),
                 1.0,
-                Affine::IDENTITY,
+                region_to_scene,
                 &region,
                 None,
                 None,
             );
             // What a `no-clip` layer is painted over: the region, in the element's own space
             let paint_area = match self.transform.determinant().abs() > 1e-12 {
-                true => self.transform.inverse().transform_rect_bbox(region),
+                true => (self.transform.inverse() * region_to_scene).transform_rect_bbox(region),
                 false => self.frame.border_box,
             };
             self.draw_css_mask(scene, true, Some(paint_area.union(self.frame.border_box)));
@@ -400,5 +420,32 @@ mod tests {
         // a box in the last tiles: the region ends with the picture
         let region = no_clip_mask_region(Rect::new(770.0, 520.0, 790.0, 590.0), (0.0, 0.0), (800.0, 600.0));
         assert_eq!((region.x0, region.y0, region.x1, region.y1), (763.0, 509.0, 800.0, 600.0));
+    }
+
+    /// Fix round 1: an element Chrome composites is masked by the tiles of its own layer, which
+    /// start at the layer's corner and are sized for the layer
+    #[test]
+    fn a_composited_layers_tiles_are_its_own() {
+        // audit 1, adv1b #g3 (`will-change: transform`): a 180 x 120 box at (40, 330) whose child
+        // overflows it to 20..440 x 310..510. The layer is 420 x 200: one tile, so the mask
+        // covers all of it (over the page's tiles it stopped at x = 255 and y = 509)
+        let layer = Rect::new(20.0, 310.0, 440.0, 510.0);
+        let region =
+            no_clip_mask_region(Rect::new(40.0, 330.0, 220.0, 450.0), (layer.x0, layer.y0), (layer.width(), layer.height()));
+        assert_eq!(region, layer);
+        // the same box in the page's own layer
+        let region = no_clip_mask_region(Rect::new(40.0, 330.0, 220.0, 450.0), (0.0, 0.0), (800.0, 600.0));
+        assert_eq!((region.x0, region.y0, region.x1, region.y1), (0.0, 255.0, 255.0, 509.0));
+
+        // a layer too large for one tile (fix1/exp/e_wc: headless Chrome masks 315..569 x 305..550):
+        // a 100 x 100 box at (340, 320) whose child overflows it to 60..760 x 50..550. The tiles
+        // are 256 pixels and start at the layer's corner: 255 and 509 pixels from it
+        let layer = Rect::new(60.0, 50.0, 760.0, 550.0);
+        let region =
+            no_clip_mask_region(Rect::new(340.0, 320.0, 440.0, 420.0), (layer.x0, layer.y0), (layer.width(), layer.height()));
+        assert_eq!((region.x0, region.y0, region.x1, region.y1), (315.0, 305.0, 569.0, 550.0));
+        // the same box with no layer of its own (fix1/exp/e_plain, and e_tx with a 2D transform)
+        let region = no_clip_mask_region(Rect::new(340.0, 320.0, 440.0, 420.0), (0.0, 0.0), (800.0, 600.0));
+        assert_eq!((region.x0, region.y0, region.x1, region.y1), (255.0, 255.0, 509.0, 509.0));
     }
 }

@@ -954,6 +954,9 @@ struct Painter {
 
 impl Painter {
     fn new(backend: Backend) -> Self {
+        // (wave 2, fix round 1) anyrender's Skia scene applies a glyph transform (a synthetic italic) to the run
+        // in the run's own space, its Vello scenes to each glyph in the font's: the painter is told which
+        blitz_paint::set_run_space_glyph_transforms(backend == Backend::Skia);
         Painter { backend, gpu: None, skia: None, hybrid: None }
     }
 
@@ -1804,6 +1807,8 @@ mod tests {
 
     #[test]
     fn the_paint_log_is_off_after_a_pass_that_fails() {
+        // (no page test paints while the log is on: it would write to it)
+        let _one_at_a_time = page_tests();
         let failed = std::panic::catch_unwind(|| {
             let _log = PaintLog::on();
             assert!(blitz_paint::PAINT_LOG.lock().unwrap().is_some());
@@ -1857,5 +1862,376 @@ mod tests {
         assert!(!refused(root.join("sub")), "a folder is no file");
         assert!(docroot.read(&url::Url::parse("data:text/plain,x").unwrap()).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ---- known-future, wave 2, fix round 1: what audit 1 found (B1-B5, N1), each on a page of the test's own ----
+
+    /// The page tests paint, and painting writes to the paint log while it is on (the test above turns it on):
+    /// one of them at a time.
+    static PAGE_TESTS: Mutex<()> = Mutex::new(());
+
+    fn page_tests() -> std::sync::MutexGuard<'static, ()> {
+        PAGE_TESTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    const PAPER: [u8; 3] = [0xf4, 0xf1, 0xea];
+
+    /// A page laid out the way a run lays one out: `head_and_body` in a `w` x `h` frame on [`PAPER`]
+    fn page(head_and_body: &str, w: u32, h: u32) -> HtmlDocument {
+        let html = format!(
+            "<!doctype html><html><head><meta charset=\"UTF-8\"><style>html,body{{margin:0;width:{w}px;height:{h}px;\
+             overflow:hidden;background:#f4f1ea}}</style>{head_and_body}</html>"
+        );
+        load_html(&html, "file:///fshot-fix-round-1-test.html".into(), "a test's page", w, h, None).document
+    }
+
+    /// Its frame, painted with Skia as every picture is: RGBA
+    fn frame(document: &mut HtmlDocument, w: u32, h: u32) -> Vec<u8> {
+        Painter::new(Backend::Skia).frame(document, w, h)
+    }
+
+    fn at(picture: &[u8], w: u32, x: u32, y: u32) -> [u8; 3] {
+        let i = ((y * w + x) * 4) as usize;
+        [picture[i], picture[i + 1], picture[i + 2]]
+    }
+
+    fn near(a: [u8; 3], b: [u8; 3]) -> bool {
+        a.iter().zip(b).all(|(a, b)| a.abs_diff(b) <= 6)
+    }
+
+    fn node<'a>(document: &'a HtmlDocument, id: &str) -> &'a blitz_dom::Node {
+        let doc: &blitz_dom::BaseDocument = document.as_ref();
+        doc.get_node(doc.get_element_by_id(id).unwrap_or_else(|| panic!("no #{id}"))).unwrap()
+    }
+
+    fn size_of(document: &HtmlDocument, id: &str) -> (f32, f32) {
+        let size = node(document, id).final_layout().size;
+        (size.width, size.height)
+    }
+
+    /// B1: a mask with `mask-clip: no-clip` is applied over the raster tiles of the compositor layer of Chrome's
+    /// that the element paints into. A 100 x 100 box at (340, 320) whose child overflows it to 60..760 x 50..550,
+    /// under a mask of dots 50px apart: where the mask is applied, the points between four dots show the page;
+    /// where it is not, the child's red. The regions are headless Chrome's (the round's `fix1/exp` pages).
+    #[test]
+    fn a_no_clip_mask_is_applied_by_the_tiles_of_the_layer_chrome_paints_the_box_into() {
+        let _one_at_a_time = page_tests();
+        const RED: [u8; 3] = [0xe6, 0x39, 0x46];
+        let masked_box = |own: &str, before: &str| {
+            format!(
+                "<style>#b{{position:absolute;left:340px;top:320px;width:100px;height:100px;background:#1d3557;{own}\
+                 mask-image:radial-gradient(circle,#000 0 50%,transparent 55%);mask-size:50px 50px;mask-repeat:repeat;\
+                 mask-clip:no-clip}}#b .ov{{position:absolute;left:-280px;top:-270px;width:700px;height:500px;\
+                 background:#e63946}}#w{{position:absolute;left:100px;top:100px;width:50px;height:50px;\
+                 background:#2a9d8f;will-change:transform}}</style></head><body>{before}<div id=\"b\"><div class=\"ov\">\
+                 </div></div></body>"
+            )
+        };
+        // (what the page is, the points that show the page, the points that show the child)
+        let cases: [(&str, String, &[(u32, u32)], &[(u32, u32)]); 6] = [
+            // the page's own layer: its tiles end 255 and 509 pixels from the picture's corner
+            ("no layer of its own", masked_box("", ""), &[(290, 270), (490, 470)], &[(240, 270), (540, 270), (290, 220), (290, 520)]),
+            // a 2D transform gives no layer (audit 1 took it to: Chrome does not composite it)
+            (
+                "transform: translateX(10px)",
+                masked_box("transform:translateX(10px);", ""),
+                &[(300, 270), (500, 470)],
+                &[(250, 270), (550, 270), (300, 220), (300, 520)],
+            ),
+            // `will-change: transform` does: the layer is what the box paints (60..760 x 50..550), and its
+            // tiles end 255 and 509 pixels from *its* corner
+            (
+                "will-change: transform",
+                masked_box("will-change:transform;", ""),
+                &[(340, 320), (540, 320), (340, 520)],
+                &[(290, 320), (590, 320), (340, 270)],
+            ),
+            ("translateZ(0)", masked_box("transform:translateZ(0);", ""), &[(340, 320), (540, 320)], &[(290, 320), (590, 320), (340, 270)]),
+            ("backface-visibility: hidden", masked_box("backface-visibility:hidden;", ""), &[(340, 320), (540, 320)], &[(290, 320), (590, 320)]),
+            // and so does painting over a layer that was painted before (the small box with `will-change`)
+            (
+                "over an earlier layer",
+                masked_box("", "<div id=\"w\"></div>"),
+                &[(340, 320), (540, 320), (340, 520)],
+                &[(290, 320), (590, 320), (340, 270)],
+            ),
+        ];
+        for (name, html, masked, unmasked) in cases {
+            let mut document = page(&html, 800, 600);
+            let picture = frame(&mut document, 800, 600);
+            for &(x, y) in masked {
+                assert!(near(at(&picture, 800, x, y), PAPER), "{name}: ({x}, {y}) is masked, is {:?}", at(&picture, 800, x, y));
+            }
+            for &(x, y) in unmasked {
+                assert!(near(at(&picture, 800, x, y), RED), "{name}: ({x}, {y}) is not masked, is {:?}", at(&picture, 800, x, y));
+            }
+        }
+
+        // A box with no reason of its own inside a layer is masked by that layer's tiles: the parent's layer
+        // starts at (100, 80), so its tiles end at x = 355 and 609 and y = 335
+        let mut document = page(
+            "<style>#p{position:absolute;left:100px;top:80px;width:640px;height:480px;will-change:transform;background:#f4f1ea}\
+             #b{position:absolute;left:300px;top:280px;width:100px;height:100px;background:#1d3557;\
+             mask-image:radial-gradient(circle,#000 0 50%,transparent 55%);mask-size:50px 50px;mask-repeat:repeat;mask-clip:no-clip}\
+             #b .ov{position:absolute;left:-290px;top:-270px;width:620px;height:460px;background:#e63946}</style></head>\
+             <body><div id=\"p\"><div id=\"b\"><div class=\"ov\"></div></div></div></body>",
+            800,
+            600,
+        );
+        let picture = frame(&mut document, 800, 600);
+        for (x, y) in [(400, 360), (600, 360), (400, 510)] {
+            assert!(near(at(&picture, 800, x, y), PAPER), "in a parent's layer: ({x}, {y}) is masked");
+        }
+        for (x, y) in [(350, 360), (650, 360), (400, 310)] {
+            assert!(near(at(&picture, 800, x, y), RED), "in a parent's layer: ({x}, {y}) is not masked");
+        }
+
+        // Audit 1's probe (adv1b #g3 and #g4): each layer is under 512 pixels both ways, one tile, so the mask
+        // covers all that the box paints. It stopped at the page's tile edges, x = 255 and y = 509.
+        let audit = "<style>.m{position:absolute;top:330px;height:120px;background:#1d3557;\
+             mask-image:radial-gradient(circle,#000 0 50%,transparent 55%);mask-size:60px 60px;mask-repeat:repeat;mask-clip:no-clip}\
+             #g3{left:40px;width:180px;will-change:transform}#g3 .ov{position:absolute;left:-20px;top:-20px;width:420px;height:200px;background:#ffb703}\
+             #g4{left:480px;width:160px;transform:translateX(10px)}#g4 .ov{position:absolute;left:-60px;top:-20px;width:320px;height:200px;background:#e76f51}\
+             </style></head><body>";
+        let mut document = page(
+            &format!("{audit}<div class=\"m\" id=\"g3\"><div class=\"ov\"></div></div><div class=\"m\" id=\"g4\"><div class=\"ov\"></div></div></body>"),
+            800,
+            600,
+        );
+        let picture = frame(&mut document, 800, 600);
+        for (x, y) in [(280, 390), (400, 450), (340, 509), (550, 509), (670, 390)] {
+            assert!(near(at(&picture, 800, x, y), PAPER), "adv1b: ({x}, {y}) is masked, is {:?}", at(&picture, 800, x, y));
+        }
+        // #g4 alone paints over no layer: it is masked by the page's tiles, whose row ends at y = 509
+        let mut document = page(&format!("{audit}<div class=\"m\" id=\"g4\"><div class=\"ov\"></div></div></body>"), 800, 600);
+        let picture = frame(&mut document, 800, 600);
+        assert!(near(at(&picture, 800, 550, 450), PAPER));
+        assert!(near(at(&picture, 800, 550, 509), [0xe7, 0x6f, 0x51]), "alone, #g4's last row is not masked: {:?}", at(&picture, 800, 550, 509));
+    }
+
+    /// B2: the `mask-mode` of a CSS mask layer overrides the `mask-type` of the `<mask>` it names, and what a
+    /// rule says of a `<mask>`'s `mask-type` or of a shape's `clip-rule` reaches the mask and the clip path.
+    #[test]
+    fn a_css_mask_mode_and_a_rules_mask_type_and_clip_rule_reach_the_svg_definition() {
+        let _one_at_a_time = page_tests();
+        const TEAL: [u8; 3] = [0x2a, 0x9d, 0x8f];
+        // A dark green circle: 0.14 by luminance, 1 by alpha. A five-pointed star whose middle is a hole by
+        // `evenodd` and filled by `nonzero`.
+        let mut document = page(
+            "<style>.box{position:absolute;top:20px;width:100px;height:100px;background:#2a9d8f}\
+             #lum{left:20px;mask-image:url(#m)}\
+             #alpha{left:140px;mask-image:url(#m);mask-mode:alpha}\
+             #rule{left:260px;mask:url(#m-rule)} #m-rule{mask-type:alpha}\
+             #back{left:380px;mask-image:url(#m-attr);mask-mode:luminance}\
+             #attr{left:500px;mask-image:url(#m-attr)}\
+             .star{top:140px}\
+             #plain{left:20px;clip-path:url(#cp)}\
+             #evenodd{left:140px;clip-path:url(#cp-rule)} #cp-rule path{clip-rule:evenodd}\
+             #inherited{left:260px;clip-path:url(#cp-inherit)} #cp-inherit{clip-rule:evenodd}\
+             #overridden{left:380px;clip-path:url(#cp-attr)} #cp-attr path{clip-rule:nonzero}\
+             #by-attr{left:500px;clip-path:url(#cp-attr-only)}</style></head><body>\
+             <svg width=\"0\" height=\"0\" style=\"position:absolute\"><defs>\
+             <mask id=\"m\" maskUnits=\"userSpaceOnUse\" x=\"0\" y=\"0\" width=\"100\" height=\"100\"><circle cx=\"50\" cy=\"50\" r=\"45\" fill=\"#003300\"/></mask>\
+             <mask id=\"m-rule\" maskUnits=\"userSpaceOnUse\" x=\"0\" y=\"0\" width=\"100\" height=\"100\"><circle cx=\"50\" cy=\"50\" r=\"45\" fill=\"#003300\"/></mask>\
+             <mask id=\"m-attr\" mask-type=\"alpha\" maskUnits=\"userSpaceOnUse\" x=\"0\" y=\"0\" width=\"100\" height=\"100\"><circle cx=\"50\" cy=\"50\" r=\"45\" fill=\"#003300\"/></mask>\
+             <clipPath id=\"cp\"><path d=\"M50,3 L79,93 L5,37 L95,37 L21,93 Z\"/></clipPath>\
+             <clipPath id=\"cp-rule\"><path d=\"M50,3 L79,93 L5,37 L95,37 L21,93 Z\"/></clipPath>\
+             <clipPath id=\"cp-inherit\"><path d=\"M50,3 L79,93 L5,37 L95,37 L21,93 Z\"/></clipPath>\
+             <clipPath id=\"cp-attr\"><path clip-rule=\"evenodd\" d=\"M50,3 L79,93 L5,37 L95,37 L21,93 Z\"/></clipPath>\
+             <clipPath id=\"cp-attr-only\"><path clip-rule=\"evenodd\" d=\"M50,3 L79,93 L5,37 L95,37 L21,93 Z\"/></clipPath>\
+             </defs></svg>\
+             <div class=\"box\" id=\"lum\"></div><div class=\"box\" id=\"alpha\"></div><div class=\"box\" id=\"rule\"></div>\
+             <div class=\"box\" id=\"back\"></div><div class=\"box\" id=\"attr\"></div>\
+             <div class=\"box star\" id=\"plain\"></div><div class=\"box star\" id=\"evenodd\"></div><div class=\"box star\" id=\"inherited\"></div>\
+             <div class=\"box star\" id=\"overridden\"></div><div class=\"box star\" id=\"by-attr\"></div></body>",
+            640,
+            260,
+        );
+        let picture = frame(&mut document, 640, 260);
+        let middle = |left: u32, top: u32| at(&picture, 640, left + 50, top + 50);
+        // the mask by its own type (luminance): the circle is nearly gone
+        let faint = middle(20, 20);
+        assert!(!near(faint, TEAL) && faint[0] > 0xc0, "a dark mask by luminance: {faint:?}");
+        // `mask-mode: alpha` reads the same mask by its alpha: the circle is whole
+        assert!(near(middle(140, 20), TEAL), "mask-mode: alpha: {:?}", middle(140, 20));
+        // a rule's `mask-type: alpha`
+        assert!(near(middle(260, 20), TEAL), "#m-rule{{mask-type:alpha}}: {:?}", middle(260, 20));
+        // `mask-mode: luminance` over a mask whose attribute says alpha, and that mask by its attribute
+        assert!(near(middle(380, 20), faint), "mask-mode: luminance over mask-type=\"alpha\": {:?}", middle(380, 20));
+        assert!(near(middle(500, 20), TEAL), "mask-type=\"alpha\": {:?}", middle(500, 20));
+        // (outside every circle the box is masked away)
+        assert!(near(at(&picture, 640, 142, 22), PAPER));
+
+        // the star's middle: filled by `nonzero`, a hole by `evenodd`
+        assert!(near(middle(20, 140), TEAL), "no clip-rule: {:?}", middle(20, 140));
+        assert!(near(middle(140, 140), PAPER), "a rule's clip-rule on the shape: {:?}", middle(140, 140));
+        assert!(near(middle(260, 140), PAPER), "a rule's clip-rule on the clipPath, inherited: {:?}", middle(260, 140));
+        assert!(near(middle(380, 140), TEAL), "a rule's nonzero over the attribute's evenodd: {:?}", middle(380, 140));
+        assert!(near(middle(500, 140), PAPER), "the attribute's evenodd: {:?}", middle(500, 140));
+        // (a point of the star: inside by either rule)
+        assert!(near(at(&picture, 640, 20 + 50, 140 + 14), TEAL));
+    }
+
+    /// B3: `-webkit-line-clamp` clamps a `-webkit-box` with `-webkit-box-orient: vertical` and nothing else; the
+    /// lines after the clamp are still painted, where the box's overflow shows; and a line of a `vertical-lr`
+    /// box that overflows ends with its ellipsis.
+    #[test]
+    fn the_legacy_line_clamp_clamps_a_vertical_webkit_box_alone_and_leaves_the_rest_to_overflow() {
+        use style::values::specified::box_::{DisplayInside, DisplayOutside};
+        let _one_at_a_time = page_tests();
+        let words = "word ".repeat(40);
+        let mut document = page(
+            &format!(
+                "<style>.t{{position:absolute;top:10px;width:120px;font-size:16px;line-height:20px;color:#000;background:#e3dac4}}\
+                 #block{{left:10px;display:block;-webkit-line-clamp:2}}\
+                 #vis{{left:150px;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:visible}}\
+                 #hid{{left:290px;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden}}\
+                 #row{{left:430px;display:-webkit-box;-webkit-line-clamp:2;overflow:hidden}}\
+                 #inl{{left:570px;display:-webkit-inline-box;-webkit-box-orient:vertical;-webkit-line-clamp:3;overflow:hidden}}\
+                 #flex{{left:710px;display:flex;-webkit-box-orient:vertical;-webkit-line-clamp:2}}\
+                 #col{{left:850px;display:-webkit-box;-webkit-box-orient:vertical}}\
+                 #col i{{display:block;width:30px;height:10px}}</style></head><body>\
+                 <div class=\"t\" id=\"block\">{words}</div><div class=\"t\" id=\"vis\">{words}</div><div class=\"t\" id=\"hid\">{words}</div>\
+                 <div class=\"t\" id=\"row\">{words}</div><div class=\"t\" id=\"inl\">{words}</div><div class=\"t\" id=\"flex\">{words}</div>\
+                 <div class=\"t\" id=\"col\"><i></i><i></i><i></i></div></body>"
+            ),
+            1000,
+            700,
+        );
+        let display = |id: &str| {
+            let display = node(&document, id).primary_styles().unwrap().get_box().display;
+            (display.outside(), display.inside())
+        };
+        let clamps = |id: &str| !node(&document, id).primary_styles().unwrap().get_box().line_clamp.is_none();
+        // a block with the legacy property: not clamped (it was, as any box that set it)
+        assert!(!clamps("block"));
+        assert!(size_of(&document, "block").1 >= 100.0, "display: block is not clamped: {:?}", size_of(&document, "block"));
+        // the vertical -webkit-box: a block container, two lines tall
+        assert_eq!(display("vis"), (DisplayOutside::Block, DisplayInside::FlowRoot));
+        assert!(clamps("vis") && clamps("hid"));
+        assert_eq!(size_of(&document, "vis"), (120.0, 40.0));
+        assert_eq!(size_of(&document, "hid"), (120.0, 40.0));
+        // with no orient it is the legacy flexbox, a row: no clamp
+        assert_eq!(display("row"), (DisplayOutside::Block, DisplayInside::Flex));
+        assert!(!clamps("row") && size_of(&document, "row").1 >= 100.0);
+        // -webkit-inline-box, vertical: clamped (absolutely positioned here, so a block outside)
+        assert!(clamps("inl"));
+        assert_eq!(size_of(&document, "inl").1, 60.0);
+        // another display with the property: no clamp
+        assert!(!clamps("flex") && size_of(&document, "flex").1 >= 100.0);
+        // a vertical -webkit-box with no clamp is a flex column
+        assert_eq!(display("col"), (DisplayOutside::Block, DisplayInside::Flex));
+        assert_eq!(size_of(&document, "col").1, 30.0);
+
+        // What is painted under the clamped boxes: the lines after the second, where the overflow is visible
+        let picture = frame(&mut document, 1000, 700);
+        let ink_below = |left: u32| (left..left + 120).any(|x| (10 + 44..10 + 100).any(|y| at(&picture, 1000, x, y)[0] < 0x60));
+        assert!(ink_below(150), "overflow: visible shows the lines after the clamp under the box");
+        assert!(!ink_below(290), "overflow: hidden clips them");
+        assert!(ink_below(10), "(the block's third line is in its box)");
+
+        // A `vertical-lr` line that overflows a box which clips it ends with an ellipsis, as a `vertical-rl`
+        // one does: the picture with `text-overflow: ellipsis` is not the picture without (it was)
+        let vertical = |mode: &str, overflow: &str| {
+            let mut document = page(
+                &format!(
+                    "<style>#v{{position:absolute;left:20px;top:10px;height:100px;writing-mode:{mode};font-size:20px;line-height:30px;\
+                     white-space:nowrap;overflow:hidden;text-overflow:{overflow};color:#000}}</style></head><body>\
+                     <div id=\"v\">Vertical text that overflows its box by far</div></body>"
+                ),
+                80,
+                130,
+            );
+            let ellipses = node(&document, "v").element_data().unwrap().inline_layout_data.as_ref().unwrap().ellipses.len();
+            (frame(&mut document, 80, 130), ellipses)
+        };
+        for mode in ["vertical-lr", "vertical-rl"] {
+            let (clipped, none) = vertical(mode, "clip");
+            let (with_ellipsis, one) = vertical(mode, "ellipsis");
+            assert_eq!((none, one), (0, 1), "{mode}");
+            assert!(clipped != with_ellipsis, "{mode}: the ellipsis is painted");
+            // (the ellipsis takes the place of text: the box's last pixels along the line are not the same)
+            let tail = |picture: &[u8]| (0..80u32).flat_map(|x| (95..110u32).map(move |y| (x, y))).map(|(x, y)| at(picture, 80, x, y)).collect::<Vec<_>>();
+            assert!(tail(&clipped) != tail(&with_ellipsis), "{mode}: at the line's end");
+        }
+    }
+
+    /// B4: where a sticky box's two insets of an axis cannot both hold, the start one (`top`, `left`) has the
+    /// last word: it is applied to the box as the end one left it.
+    #[test]
+    fn a_sticky_boxs_start_inset_has_the_last_word_over_its_end_inset() {
+        let _one_at_a_time = page_tests();
+        let document = page(
+            "<style>.c{position:absolute;top:20px;width:160px;height:108px;overflow:auto;border:4px solid #1e1b2e;box-sizing:border-box}\
+             .c .wrap{height:300px}.c .st{position:sticky;top:40px;bottom:40px;height:50px;background:#e63946}\
+             #c1{left:20px}#c1 .sp{height:50px}#c2{left:210px}#c2 .sp{height:20px}\
+             #c3{left:400px;height:160px}#c3 .sp{height:60px}#c3 .st{top:20px;bottom:20px;height:40px}\
+             #h{position:absolute;left:20px;top:150px;width:208px;height:80px;overflow:auto;border:4px solid #1e1b2e;box-sizing:border-box}\
+             #h .wide{width:700px;height:60px;display:flex}#h .pad{width:300px;flex:none}\
+             #h .st{position:sticky;left:150px;right:150px;width:80px;height:60px;flex:none}</style></head><body>\
+             <div class=\"c\" id=\"c1\"><div class=\"wrap\"><div class=\"sp\"></div><div class=\"st\" id=\"s1\"></div></div></div>\
+             <div class=\"c\" id=\"c2\"><div class=\"wrap\"><div class=\"sp\"></div><div class=\"st\" id=\"s2\"></div></div></div>\
+             <div class=\"c\" id=\"c3\"><div class=\"wrap\"><div class=\"sp\"></div><div class=\"st\" id=\"s3\"></div></div></div>\
+             <div id=\"h\"><div class=\"wide\"><div class=\"pad\"></div><div class=\"st\" id=\"s4\"></div></div></div></body>",
+            800,
+            300,
+        );
+        let placed = |id: &str| {
+            let at = node(&document, id).placed_location();
+            (at.x, at.y)
+        };
+        // a 50px box in a 100px scrollport with top: 40px and bottom: 40px. From y = 50, `bottom` pulls it up to
+        // 10 and `top` pushes it from there to 40 (it stayed at 10: `top` was measured from where it started)
+        assert_eq!(placed("s1"), (0.0, 40.0));
+        // from y = 20: up to 10, then down to 40
+        assert_eq!(placed("s2"), (0.0, 40.0));
+        // where both hold (a 40px box at 60 in a 152px scrollport, 20px each side) the box stays
+        assert_eq!(placed("s3"), (0.0, 60.0));
+        // left: 150px and right: 150px on an 80px box at x = 300 in a 200px scrollport: left wins, at 150
+        assert_eq!(placed("s4"), (150.0, 0.0));
+    }
+
+    /// B5: a flex item's preferred aspect ratio is the ratio of the box that `box-sizing` names. A cross size that
+    /// goes through it, and a minimum or maximum transferred through it, lose the padding and border first.
+    #[test]
+    fn a_flex_items_aspect_ratio_is_its_content_boxs_with_box_sizing_content_box() {
+        let _one_at_a_time = page_tests();
+        let document = page(
+            "<style>.f{position:absolute;left:20px;width:360px;display:flex;gap:12px;padding:8px;background:#e3dac4}\
+             .f>div{background:#2a9d8f}\
+             #row{top:20px;height:120px;align-items:stretch}#row .w{width:60px}\
+             #a{aspect-ratio:2/1;box-sizing:content-box;padding:25px 0;border:5px solid #1e1b2e}\
+             #row2{top:170px;height:120px;align-items:stretch}\
+             #b{aspect-ratio:2/1;box-sizing:border-box;padding:25px 0;border:5px solid #1e1b2e}\
+             #col{top:320px;width:160px;flex-direction:column}\
+             #c{aspect-ratio:2/1;box-sizing:content-box;padding:8px 14px;border:6px solid #1e1b2e}\
+             #min{top:460px;height:80px;align-items:flex-start}\
+             #d{aspect-ratio:2/1;box-sizing:content-box;min-height:30px;padding:8px 2px;border:5px solid #1e1b2e;flex:0 1 0px}\
+             #e{aspect-ratio:2/1;box-sizing:content-box;height:60px;max-height:20px;padding:8px 2px;border:5px solid #1e1b2e}\
+             #n{aspect-ratio:2/1;box-sizing:content-box;max-height:20px;padding:8px 2px;border:5px solid #1e1b2e}</style></head><body>\
+             <div class=\"f\" id=\"row\"><div id=\"a\"></div><div class=\"w\"></div></div>\
+             <div class=\"f\" id=\"row2\"><div id=\"b\"></div></div>\
+             <div class=\"f\" id=\"col\"><div id=\"c\"></div></div>\
+             <div class=\"f\" id=\"min\"><div id=\"d\"></div><div id=\"e\"></div><div id=\"n\"></div></div></body>",
+            420,
+            580,
+        );
+        // (every size is headless Chrome's for this page)
+        // audit 1, adv4c: stretched to 120px, 60px of it padding and border: 60px of content high, so 120px of
+        // content wide and 130px in all (it was 240px: the border box's height through the ratio)
+        assert_eq!(size_of(&document, "a"), (130.0, 120.0));
+        // with border-box the ratio is the border box's
+        assert_eq!(size_of(&document, "b"), (240.0, 120.0));
+        // audit 1, adv4 `.fc`: a column item stretched to 160px wide, 40px of it padding and border: 120px of
+        // content wide, 60px high, 88px in all, and its container 104px (it was 96px: the container was sized
+        // for an item of 80px, the border box's width through the ratio)
+        assert_eq!(size_of(&document, "c"), (160.0, 88.0));
+        assert_eq!(size_of(&document, "col").1, 104.0);
+        // a minimum transferred: min-height 30px is 60px of content wide, 74px in all (it was 112px)
+        assert_eq!(size_of(&document, "d"), (74.0, 56.0));
+        // a maximum transferred: height 60px held to 20px is 40px of content wide, 54px in all (it was 92px)
+        assert_eq!(size_of(&document, "e"), (54.0, 46.0));
+        // with no size to transfer an empty item is its padding and border alone
+        assert_eq!(size_of(&document, "n"), (14.0, 26.0));
     }
 }

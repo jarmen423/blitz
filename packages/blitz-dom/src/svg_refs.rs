@@ -57,6 +57,31 @@ impl SvgReferenceKind {
     }
 }
 
+/// known-future (wave 2, fix round 1): what the `mask-mode` of a CSS mask layer makes of the
+/// `<mask>` it names. `alpha` and `luminance` override the mask's own `mask-type` (CSS Masking 1,
+/// 6.2: `match-source` alone leaves it to the `<mask>`), so a mask whose dark green circle hides
+/// its element by luminance shows it whole under `mask-mode: alpha`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SvgMaskMode {
+    /// `mask-mode: match-source`: the `<mask>`'s own `mask-type`
+    MatchSource,
+    /// `mask-mode: alpha`
+    Alpha,
+    /// `mask-mode: luminance`
+    Luminance,
+}
+
+impl SvgMaskMode {
+    /// The `mask-type` the `<mask>` is given in place of its own, if any
+    fn mask_type(self) -> Option<&'static str> {
+        match self {
+            Self::MatchSource => None,
+            Self::Alpha => Some("alpha"),
+            Self::Luminance => Some("luminance"),
+        }
+    }
+}
+
 /// The SVG document made for one reference (see the module documentation), parsed.
 #[derive(Clone, Debug)]
 pub struct SvgReference {
@@ -101,16 +126,26 @@ impl BaseDocument {
     /// The document made for a reference of the given kind to the definition `target`, from an
     /// element whose border box is `width` x `height` CSS pixels (see the module documentation).
     /// `None` if usvg cannot make anything of it.
+    ///
+    /// `mask_mode` is the `mask-mode` of the CSS mask layer that names a `<mask>` (fix round 1):
+    /// other than `match-source`, it is the `mask-type` the mask is written with. It is part of
+    /// the document's source, so of what the parsed documents are kept by: the same mask named
+    /// with another mode is another document.
     pub fn svg_reference(
         &self,
         target: NodeId,
         kind: SvgReferenceKind,
         width: f32,
         height: f32,
+        mask_mode: SvgMaskMode,
     ) -> Option<SvgReference> {
         let node = self.get_node(target)?;
         let element = node.element_data()?;
         let id = element.attr(local_name!("id"))?;
+        let mask_type = match kind {
+            SvgReferenceKind::Mask => mask_mode.mask_type().map(|value| (target, value)),
+            _ => None,
+        };
 
         // The outermost <svg> around the definition, whose content becomes the <defs>
         let mut root = None;
@@ -129,11 +164,11 @@ impl BaseDocument {
             Some(root) => {
                 for &child in &root.children {
                     if let Some(child) = self.get_node(child) {
-                        defs.push_str(&child.svg_definition_source());
+                        defs.push_str(&child.svg_definition_source(mask_type));
                     }
                 }
             }
-            None => defs.push_str(&node.svg_definition_source()),
+            None => defs.push_str(&node.svg_definition_source(mask_type)),
         }
 
         // A definition in `objectBoundingBox` units is measured in the rectangle that names it
@@ -185,6 +220,9 @@ impl BaseDocument {
 
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         source.hash(&mut hasher);
+        // (the mode is in the source already, where it changes the mask; it is hashed for itself
+        // too, so that no two modes can ever share a document)
+        (kind, mask_type.map(|(_, value)| value)).hash(&mut hasher);
         let key = hasher.finish();
         let mut cache = self.svg_reference_cache.0.lock().unwrap();
         if let Some(cached) = cache.get(&key) {

@@ -1022,11 +1022,14 @@ fn collect_table_cells(
 
             cursor.place(colspan, rowspan);
         }
+        // (`WebkitBox` is never a computed display: Stylo's style adjuster turns it into a block
+        // or flex container)
         DisplayInside::Flow
         | DisplayInside::FlowRoot
         | DisplayInside::Flex
         | DisplayInside::Grid
-        | DisplayInside::GridLanes => {
+        | DisplayInside::GridLanes
+        | DisplayInside::WebkitBox => {
             node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
             // Probably a table caption: ignore
             // println!(

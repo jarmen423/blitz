@@ -19,9 +19,10 @@ use std::sync::Arc;
 
 use anyrender::recording::RenderCommand;
 use anyrender::{Filter, MaskMode, PaintScene};
-use blitz_dom::{SvgReference, SvgReferenceKind};
+use blitz_dom::{SvgMaskMode, SvgReference, SvgReferenceKind};
 use kurbo::{Affine, Rect};
 use peniko::{Fill, Mix};
+use style::properties::generated::longhands::mask_mode::single_value::computed_value::T as StyloMaskMode;
 use style::values::computed::basic_shape::ClipPath;
 use style::values::computed::url::ComputedUrl;
 use style::values::generics::image::GenericImage;
@@ -32,8 +33,10 @@ use super::{ALMOST_OPAQUE, ElementCx};
 const UNBOUNDED: Rect = Rect::new(-1.0e7, -1.0e7, 1.0e7, 1.0e7);
 
 impl ElementCx<'_, '_> {
-    /// The document made for `url` if it names an inline SVG definition of the given kind
-    fn svg_reference(&self, url: &ComputedUrl, kind: SvgReferenceKind) -> Option<SvgReference> {
+    /// The document made for `url` if it names an inline SVG definition of the given kind.
+    /// `mask_mode` is the `mask-mode` of the mask layer that names a `<mask>` (`match-source`
+    /// for any other reference).
+    fn svg_reference(&self, url: &ComputedUrl, kind: SvgReferenceKind, mask_mode: SvgMaskMode) -> Option<SvgReference> {
         let url = url.url()?;
         let dom = self.context.dom;
         let target = dom.svg_reference_target(url, kind)?;
@@ -43,6 +46,7 @@ impl ElementCx<'_, '_> {
             kind,
             (border_box.width() / self.scale) as f32,
             (border_box.height() / self.scale) as f32,
+            mask_mode,
         )
     }
 
@@ -68,7 +72,7 @@ impl ElementCx<'_, '_> {
     /// the element. A reference to anything else clips nothing (CSS Masking 1, 5.1).
     pub(super) fn svg_clip_reference(&self) -> Option<SvgReference> {
         match self.style.get_clip_path() {
-            ClipPath::Url(url) => self.svg_reference(url, SvgReferenceKind::ClipPath),
+            ClipPath::Url(url) => self.svg_reference(url, SvgReferenceKind::ClipPath, SvgMaskMode::MatchSource),
             _ => None,
         }
     }
@@ -107,10 +111,22 @@ impl ElementCx<'_, '_> {
         scene.pop_layer(); // Isolation layer
     }
 
-    /// The mask image layer at `idx` if it is a `url(#id)` that names an inline `<mask>`
+    /// The mask image layer at `idx` if it is a `url(#id)` that names an inline `<mask>`.
+    ///
+    /// The layer's `mask-mode` goes with the reference (fix round 1): `alpha` or `luminance`
+    /// is what the `<mask>` is read by, whatever its own `mask-type` (CSS Masking 1, 6.2); with
+    /// `match-source` the mask's own stands.
     pub(super) fn svg_mask_reference(&self, idx: usize) -> Option<SvgReference> {
-        match self.style.get_svg().mask_image.0.get(idx)? {
-            GenericImage::Url(url) => self.svg_reference(url, SvgReferenceKind::Mask),
+        let svg_styles = self.style.get_svg();
+        match svg_styles.mask_image.0.get(idx)? {
+            GenericImage::Url(url) => {
+                let mask_mode = match super::background::get_cyclic(&svg_styles.mask_mode.0, idx) {
+                    StyloMaskMode::MatchSource => SvgMaskMode::MatchSource,
+                    StyloMaskMode::Alpha => SvgMaskMode::Alpha,
+                    StyloMaskMode::Luminance => SvgMaskMode::Luminance,
+                };
+                self.svg_reference(url, SvgReferenceKind::Mask, mask_mode)
+            }
             _ => None,
         }
     }
@@ -128,7 +144,7 @@ impl ElementCx<'_, '_> {
     /// The filter graph of `url` if it names an inline `<filter>`, in the element's own space
     /// (CSS pixels from the border box's corner)
     pub(super) fn svg_filter_reference(&self, url: &ComputedUrl) -> Option<Arc<Filter>> {
-        let reference = self.svg_reference(url, SvgReferenceKind::Filter)?;
+        let reference = self.svg_reference(url, SvgReferenceKind::Filter, SvgMaskMode::MatchSource)?;
         filter_of_reference(&reference)
     }
 }
