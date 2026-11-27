@@ -10767,6 +10767,7 @@ name = "wpt"
 version = "0.1.0"
 dependencies = [
  "anyrender",
+ "anyrender_skia",
  "anyrender_tiny_skia",
  "anyrender_vello",
  "anyrender_vello_cpu",
@@ -10795,6 +10796,7 @@ dependencies = [
  "rayon",
  "regex",
  "serde_json",
+ "skia-safe",
  "stylo",
  "stylo_traits",
  "supports-hyperlinks",

@@ -7,7 +7,12 @@ rust-version.workspace = true
 publish = false
 
 [features]
-default = ["cpu", "tiny-skia"]
+# known-future (wave 1a): Skia is compiled in by default and is the default renderer (the first of
+# `RendererKind::all`): it is the rasteriser every picture of the known-future renderer is painted with
+# (apps/fshot), so its results are the ones that say what that renderer draws. `--renderer vello-cpu` and
+# `--renderer tiny-skia` are as before.
+default = ["skia", "cpu", "tiny-skia"]
+skia = ["dep:anyrender_skia", "dep:skia-safe"]
 gpu = ["dep:anyrender_vello"]
 cpu = ["dep:anyrender_vello_cpu"]
 tiny-skia = ["dep:anyrender_tiny_skia"]
@@ -23,6 +28,9 @@ anyrender = { workspace = true }
 anyrender_vello = { workspace = true, optional = true }
 anyrender_vello_cpu = { workspace = true, optional = true }
 anyrender_tiny_skia = { workspace = true, optional = true }
+anyrender_skia = { workspace = true, optional = true }
+# (the version apps/fshot and anyrender_skia use)
+skia-safe = { version = "0.157.0", optional = true }
 
 taffy = { workspace = true }
 style = { workspace = true }
