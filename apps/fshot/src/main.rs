@@ -5,6 +5,8 @@
 //!                                                              on a transparent background
 //!   fshot paintset base.html setjobs.txt                       load once, paint many pictures
 //!   fshot boxes in1.html out1.json [in2.html out2.json ...]    each element's CSSOM boxes (offsetWidth & co.), no paint
+//!   fshot serve                                                (wave 1a) one process for a scene: requests on stdin,
+//!                                                              answers on stdout, a line of JSON each (serve.rs)
 //! A page that holds `<meta name="fshot-viewport" content="WxH">` is laid out at W x H instead of 1920x1080 in
 //! every mode (its frame size: `vw`, `vh`, the root's percentage sizes and media queries depend on it).
 //!
@@ -22,12 +24,21 @@
 //!   FSHOT_LCD=rgb|bgr           LCD text where it lands on opaque pixels (default off: grayscale everywhere)
 //!   FSHOT_TEXT_HINT=0|1         override the hinting; FSHOT_IMAGE_QUALITY=low|medium|high for image-rendering:auto
 //! Pages are loaded from disk; their <base href> (which Blitz doesn't apply itself) becomes the base URL.
+//! (wave 1a) No CSS transition runs: a page is painted as it stands, and when `paintset` or `serve` change its CSS or an
+//! attribute, the changed values apply at once (a transition would be painted at its first instant: the old value).
 //! What it fetches by itself (known-future, net round 1):
 //!   FSHOT_NET=local             (default) `file:` and `data:` addresses only; every other address a page names (http,
 //!                               https, ...) is refused, not fetched, and listed on stderr at the end of each page's load
 //!                               as one line `FSHOT-REFUSED ["<url>", ...]` (the renderer fetches what a page may have
 //!                               itself, by its rules, before the layout: known_future/weblocal.py)
 //!   FSHOT_NET=open              blitz-net as it was: anything, over http too, from any host (a developer's own pages only)
+//!   FSHOT_NET=none              (wave 1a) another name for `local`
+//!   FSHOT_DOCROOT=DIR[:DIR...]  (wave 1a; unset: no such limit) every file read for a page, the page itself too, must be
+//!                               inside one of these folders once its symbolic links and `..` are resolved: its style
+//!                               sheets, pictures, fonts, and what an inline <svg>'s <image> names. A `file:` address
+//!                               outside them is not read: the fetch fails, and the address is listed on stderr at the end
+//!                               of the page's load as `FSHOT-DOCROOT-REFUSED ["<url>", ...]`. A second wall for a render
+//!                               that runs with no sandbox around it; inside one, name what the sandbox shows.
 //! (wave 0) What an inline <svg>'s <image href|xlink:href> names is resolved against the page's base URL and goes
 //! through the same guard: `file:` and `data:` are read, anything else is refused and listed with FSHOT_NET=local.
 //! An SVG that is a picture itself (<img src>, a CSS url()) loads no file of its own, as in a browser.
@@ -48,13 +59,19 @@ use peniko::kurbo::Rect;
 use style::values::computed::CSSPixelLength;
 use blitz_traits::net::{Bytes, NetHandler, NetProvider, Request};
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{fmt::Write as _, fs::File, io::BufWriter, sync::Arc, time::Instant};
 use vello_gpu::{
     RenderOptions, RenderSize, RenderTarget, RenderTargetConfig, Renderer as VelloHybridRenderer,
     Resources as HybridResources, Scene as VelloHybridScene,
 };
 use wgpu_context::{BufferRenderer, BufferRendererConfig, DeviceHandle};
+
+mod analyze;
+mod serve;
+mod sha256;
 
 const VW: u32 = 1920;
 const VH: u32 = 1080;
@@ -461,19 +478,128 @@ struct FetchGuard {
     open: bool,
     refused: Arc<Mutex<Vec<String>>>,
     failed: Arc<Mutex<HashSet<String>>>,
+    /// (wave 1a) FSHOT_DOCROOT: the folders a `file:` address must be inside, and the addresses that were not
+    docroot: Option<Arc<Docroot>>,
+    outside: Arc<Mutex<Vec<String>>>,
+    /// (wave 1a) files being read under FSHOT_DOCROOT (the load waits for them as it waits for blitz-net's fetches)
+    pending: Arc<AtomicUsize>,
+}
+
+/// FSHOT_NET: may the layout engine fetch from the web by itself (header)?
+fn net_is_open() -> bool {
+    match std::env::var("FSHOT_NET").as_deref() {
+        Err(_) | Ok("") | Ok("local") | Ok("none") => false,
+        Ok("open") => true,
+        Ok(other) => {
+            eprintln!("warning: FSHOT_NET={other:?} is not one of local, none, open: fetching only file: and data: addresses");
+            false
+        }
+    }
 }
 
 impl FetchGuard {
     fn from_env(inner: Arc<Provider>) -> Self {
-        let open = match std::env::var("FSHOT_NET").as_deref() {
-            Err(_) | Ok("") | Ok("local") => false,
-            Ok("open") => true,
-            Ok(other) => {
-                eprintln!("warning: FSHOT_NET={other:?} is not one of local, open: fetching only file: and data: addresses");
-                false
+        FetchGuard {
+            inner,
+            open: net_is_open(),
+            refused: Default::default(),
+            failed: Default::default(),
+            docroot: Docroot::from_env(),
+            outside: Default::default(),
+            pending: Default::default(),
+        }
+    }
+}
+
+/// known-future (wave 1a): FSHOT_DOCROOT, the folders every file read for a page must be inside (header). The
+/// folders are named as PATH names them (`:` between them) and are resolved once, when first asked for.
+struct Docroot {
+    roots: Vec<PathBuf>,
+}
+
+/// Why a `file:` address was not read under FSHOT_DOCROOT
+struct DocrootError {
+    /// the address is outside every folder of FSHOT_DOCROOT (and is listed as refused), not merely unreadable
+    outside: bool,
+    message: String,
+}
+
+const OUTSIDE_DOCROOT: &str = "refused: the file is outside FSHOT_DOCROOT";
+
+impl Docroot {
+    fn from_env() -> Option<Arc<Docroot>> {
+        static ROOTS: std::sync::OnceLock<Option<Arc<Docroot>>> = std::sync::OnceLock::new();
+        ROOTS
+            .get_or_init(|| {
+                let value = std::env::var_os("FSHOT_DOCROOT").filter(|v| !v.is_empty())?;
+                let mut roots: Vec<PathBuf> = Vec::new();
+                for dir in std::env::split_paths(&value).filter(|d| !d.as_os_str().is_empty()) {
+                    // (a folder that cannot be resolved would confine nothing while seeming to: that is an error)
+                    match std::fs::canonicalize(&dir) {
+                        Ok(real) if real.is_dir() => {
+                            if !roots.contains(&real) {
+                                roots.push(real);
+                            }
+                        }
+                        Ok(real) => backend_error(format!("FSHOT_DOCROOT names {}, which is not a folder", real.display())),
+                        Err(e) => backend_error(format!("FSHOT_DOCROOT names {}, which cannot be resolved: {e}", dir.display())),
+                    }
+                }
+                if roots.is_empty() {
+                    backend_error("FSHOT_DOCROOT names no folder".to_string());
+                }
+                Some(Arc::new(Docroot { roots }))
+            })
+            .clone()
+    }
+
+    fn contains(&self, real: &Path) -> bool {
+        self.roots.iter().any(|root| real.starts_with(root))
+    }
+
+    /// The real path of `path` (symbolic links and `..` resolved) when it is inside a folder of FSHOT_DOCROOT.
+    fn resolve(&self, path: &Path) -> Result<PathBuf, DocrootError> {
+        match std::fs::canonicalize(path) {
+            Ok(real) if self.contains(&real) => Ok(real),
+            Ok(_) => Err(DocrootError { outside: true, message: OUTSIDE_DOCROOT.into() }),
+            // no such file (or one that cannot be reached): outside when its name alone already is
+            Err(e) => Err(DocrootError { outside: !self.contains(path), message: format!("io error: {e}") }),
+        }
+    }
+
+    /// The bytes of the file a `file:` address names, read only when its real path is inside FSHOT_DOCROOT: the
+    /// path is resolved, checked, opened, and the opened file is checked to be that very path and a regular file
+    /// (so nothing that changes on disk between the check and the read is read in its place).
+    fn read(&self, url: &url::Url) -> Result<Bytes, DocrootError> {
+        use std::io::Read as _;
+        let io = |e: std::io::Error| DocrootError { outside: false, message: format!("io error: {e}") };
+        let path = url.to_file_path().map_err(|()| DocrootError { outside: true, message: "not a file path".into() })?;
+        let real = self.resolve(&path)?;
+        let mut file = File::open(&real).map_err(io)?;
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd as _;
+            // (where /proc is not mounted there is nothing to compare with, and the check above stands alone)
+            if let Ok(opened) = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())) {
+                if opened != real || !self.contains(&opened) {
+                    return Err(DocrootError { outside: true, message: OUTSIDE_DOCROOT.into() });
+                }
             }
-        };
-        FetchGuard { inner, open, refused: Default::default(), failed: Default::default() }
+        }
+        if !file.metadata().map_err(io)?.is_file() {
+            return Err(DocrootError { outside: false, message: "io error: not a regular file".into() });
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map_err(io)?;
+        Ok(Bytes::from(bytes))
+    }
+}
+
+/// The page itself is a file read for the page: under FSHOT_DOCROOT it must be inside too.
+fn docroot_allows_page(path: &Path) -> Result<(), String> {
+    match Docroot::from_env() {
+        Some(docroot) if !docroot.contains(path) => Err(format!("{} is outside FSHOT_DOCROOT", path.display())),
+        _ => Ok(()),
     }
 }
 
@@ -496,6 +622,23 @@ impl NetHandler for WatchFailure {
 const REFUSED: &str = "refused: the layout engine fetches nothing by itself (FSHOT_NET=local)";
 
 impl FetchGuard {
+    /// (wave 1a) The folders a `file:` address is confined to, when FSHOT_DOCROOT names any: such an address is
+    /// read here, by `Docroot::read`, and not by blitz-net.
+    fn confined(&self, url: &url::Url) -> Option<&Arc<Docroot>> {
+        self.docroot.as_ref().filter(|_| url.scheme() == "file")
+    }
+
+    /// Record a `file:` address that was not read under FSHOT_DOCROOT (never waited for; listed when it was outside)
+    fn note_unread(failed: &Mutex<HashSet<String>>, outside: &Mutex<Vec<String>>, url: &str, error: &DocrootError) {
+        failed.lock().unwrap().insert(url.to_string());
+        if error.outside {
+            let mut o = outside.lock().unwrap();
+            if !o.iter().any(|u| u == url) {
+                o.push(url.to_string());
+            }
+        }
+    }
+
     /// May this address be fetched by the layout engine itself? `file:` and `data:` always; any other only with
     /// FSHOT_NET=open. One that may not is recorded (listed as refused, and never waited for).
     fn allows(&self, url: &url::Url) -> bool {
@@ -529,6 +672,23 @@ impl NetHandler for SyncAnswer {
 impl NetProvider for FetchGuard {
     fn fetch(&self, doc_id: usize, request: Request, handler: Box<dyn NetHandler>) {
         let url = request.url.to_string();
+        if let Some(docroot) = self.confined(&request.url) {
+            // (wave 1a) read on one of the runtime's threads, as blitz-net reads, and counted while it is read
+            let (docroot, failed, outside, pending) =
+                (Arc::clone(docroot), Arc::clone(&self.failed), Arc::clone(&self.outside), Arc::clone(&self.pending));
+            pending.fetch_add(1, Ordering::SeqCst);
+            tokio::task::spawn_blocking(move || {
+                match docroot.read(&request.url) {
+                    Ok(bytes) => handler.bytes(url, bytes),
+                    Err(error) => {
+                        Self::note_unread(&failed, &outside, &url, &error);
+                        handler.error(url, error.message);
+                    }
+                }
+                pending.fetch_sub(1, Ordering::SeqCst);
+            });
+            return;
+        }
         if self.allows(&request.url) {
             let watched = Box::new(WatchFailure { inner: handler, url, failed: Arc::clone(&self.failed) });
             return self.inner.fetch(doc_id, request, watched);
@@ -543,6 +703,15 @@ impl NetProvider for FetchGuard {
     /// which is none of them).
     fn fetch_sync(&self, doc_id: usize, request: Request) -> Option<Result<(String, Bytes), String>> {
         let url = request.url.to_string();
+        if let Some(docroot) = self.confined(&request.url) {
+            return Some(match docroot.read(&request.url) {
+                Ok(bytes) => Ok((url, bytes)),
+                Err(error) => {
+                    Self::note_unread(&self.failed, &self.outside, &url, &error);
+                    Err(error.message)
+                }
+            });
+        }
         if !self.allows(&request.url) {
             return Some(Err(REFUSED.into()));
         }
@@ -579,33 +748,74 @@ fn json_string(s: &str) -> String {
     o
 }
 
+/// A page laid out, and what its load was refused: the web addresses the layout engine did not fetch by itself
+/// (FSHOT_NET) and the `file:` addresses outside FSHOT_DOCROOT.
+struct Loaded {
+    document: HtmlDocument,
+    refused: Vec<String>,
+    outside: Vec<String>,
+}
+
+impl Loaded {
+    /// The lines a load ends with on stderr (header): the renderer reads `FSHOT-REFUSED` to fetch what a page may have.
+    fn report(&self) {
+        for (tag, list) in [("FSHOT-REFUSED", &self.refused), ("FSHOT-DOCROOT-REFUSED", &self.outside)] {
+            if !list.is_empty() {
+                let list: Vec<String> = list.iter().map(|u| json_string(u)).collect();
+                eprintln!("{tag} [{}]", list.join(","));
+            }
+        }
+    }
+}
+
+/// The base URL of a page: its `<base href>` (which Blitz does not apply itself), or the address it has by itself
+fn page_base_url(html: &str, own: impl FnOnce() -> String) -> String {
+    html.find("<base href=\"")
+        .and_then(|i| {
+            let r = &html[i + 12..];
+            r.find('"').map(|j| r[..j].to_string())
+        })
+        .unwrap_or_else(own)
+}
+
 fn load(input: &str, vw: u32, vh: u32) -> HtmlDocument {
     let path = std::fs::canonicalize(input).unwrap();
+    if let Err(message) = docroot_allows_page(&path) {
+        backend_error(message);
+    }
     let html = std::fs::read_to_string(&path).unwrap();
-    let (vw, vh) = page_viewport(&html).unwrap_or((vw, vh));
     if page_wants_chrome_generics(&html) {
-        // (read when the document's font collection is made, below; fshot loads one page per process)
+        // (read when the document's font collection is made, below; fshot loads one page per process, and `serve`,
+        // which loads many, sets it for each: serve.rs)
         unsafe { std::env::set_var("BLITZ_CHROME_GENERICS", "1") };
     }
-    let url = html
-        .find("<base href=\"")
-        .map(|i| {
-            let r = &html[i + 12..];
-            r[..r.find('"').unwrap()].to_string()
-        })
-        .unwrap_or_else(|| url::Url::from_file_path(&path).unwrap().to_string());
+    let url = page_base_url(&html, || url::Url::from_file_path(&path).unwrap().to_string());
+    let loaded = load_html(&html, url, input, vw, vh, None);
+    loaded.report();
+    loaded.document
+}
+
+/// Lay a page out: `html` at the base URL `url`, in a `vw` x `vh` frame unless it names its own. `font_ctx` is the
+/// font collection it starts from (`serve` hands every page a copy of one made once); with none the document
+/// makes its own, as every one-page run does.
+fn load_html(html: &str, url: String, input: &str, vw: u32, vh: u32, font_ctx: Option<blitz_dom::FontContext>) -> Loaded {
+    let (vw, vh) = page_viewport(html).unwrap_or((vw, vh));
     let base = url::Url::parse(&url).ok();
     let net = Arc::new(Provider::new(None));
     let guard = Arc::new(FetchGuard::from_env(Arc::clone(&net)));
     let mut document = HtmlDocument::from_html(
-        &html,
+        html,
         DocumentConfig {
             base_url: Some(url),
             net_provider: Some(Arc::clone(&guard) as _),
             viewport: Some(Viewport::new(vw, vh, 1.0, ColorScheme::Light)),
+            font_ctx,
             ..Default::default()
         },
     );
+    // (wave 1a) fshot paints a page as it stands, and after `paintset` or `serve` change its CSS, as it then
+    // stands: no CSS transition is started, which would hold every changed value at what it was before
+    document.as_mut().set_css_transitions_enabled(false);
     // Wait until every <img> has its decoded image, not just until the downloads are done: images are decoded
     // after the fetch and arrive as messages, and painting earlier silently leaves them out.
     let img = LocalName::from("img");
@@ -624,7 +834,7 @@ fn load(input: &str, vw: u32, vh: u32) -> HtmlDocument {
                     base.as_ref().and_then(|b| b.join(s.trim()).ok()).is_some_and(|u| failed.contains(u.as_str()))
                 })
         });
-        if net.is_empty() && !doc.has_pending_critical_resources() && !waiting {
+        if net.is_empty() && guard.pending.load(Ordering::SeqCst) == 0 && !doc.has_pending_critical_resources() && !waiting {
             break;
         }
         if t0.elapsed().as_secs() > 30 {
@@ -634,13 +844,9 @@ fn load(input: &str, vw: u32, vh: u32) -> HtmlDocument {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     document.as_mut().resolve(0.0);
-    let refused = guard.refused.lock().unwrap();
-    if !refused.is_empty() {
-        let list: Vec<String> = refused.iter().map(|u| json_string(u)).collect();
-        eprintln!("FSHOT-REFUSED [{}]", list.join(","));
-    }
-    drop(refused);
-    document
+    let refused = guard.refused.lock().unwrap().clone();
+    let outside = guard.outside.lock().unwrap().clone();
+    Loaded { document, refused, outside }
 }
 
 fn render(document: &mut HtmlDocument, w: u32, h: u32, white: bool) -> Vec<u8> {
@@ -672,18 +878,146 @@ fn write_png(path: &str, buf: &mut [u8], w: u32, h: u32) {
     wr.finish().unwrap();
 }
 
+/// The bytes `write_png` puts in its file (the same encoder, asked the same way: `serve` writes them itself, to
+/// answer with their size and digest and to say so, not stop, when the file cannot be written)
+fn png_bytes(buf: &[u8], w: u32, h: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    {
+        let mut enc = png::Encoder::new(BufWriter::new(&mut out), w, h);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut wr = enc.write_header().unwrap();
+        wr.write_image_data(buf).unwrap();
+        wr.finish().unwrap();
+    }
+    out
+}
+
+/// A picture's file: the raw RGBA bytes when its name ends in `.rgba`, a PNG otherwise (`paint` and `paintset`)
+fn write_picture(output: &str, buf: &mut [u8], w: u32, h: u32) {
+    if output.ends_with(".rgba") {
+        std::fs::write(output, &*buf).unwrap();
+    } else {
+        write_png(output, buf, w, h);
+    }
+}
+
+/// The rasteriser of a run and what it keeps between pictures (one per process: every picture of a run, and
+/// every page `serve` holds, is painted by the same one).
+struct Painter {
+    backend: Backend,
+    gpu: Option<anyrender_vello::VelloImageRenderer>,
+    skia: Option<SkiaOffscreen>,
+    hybrid: Option<HybridOffscreen>,
+}
+
+impl Painter {
+    fn new(backend: Backend) -> Self {
+        Painter { backend, gpu: None, skia: None, hybrid: None }
+    }
+
+    /// A `w` x `h` picture of the page on a transparent background, straight (not premultiplied) RGBA: what
+    /// `paint` and `paintset` write.
+    fn picture(&mut self, document: &mut HtmlDocument, w: u32, h: u32) -> Vec<u8> {
+        match self.backend {
+            Backend::VelloGpu => {
+                let r = self.gpu.get_or_insert_with(|| anyrender_vello::VelloImageRenderer::new(w, h));
+                r.resize(w, h);
+                let mut v = Vec::new();
+                r.render_to_vec(|scene| paint_scene(scene, document.as_mut(), 1.0, w, h, 0, 0), &mut v);
+                v
+            }
+            Backend::Skia => {
+                let r = self.skia.get_or_insert_with(SkiaOffscreen::new);
+                let mut b = r.render(document, w, h, false);
+                unpremultiply(&mut b);
+                b
+            }
+            Backend::VelloHybrid => {
+                let r = self.hybrid.get_or_insert_with(|| HybridOffscreen::new(w, h));
+                let mut b = r.render(document, w, h, false);
+                unpremultiply(&mut b);
+                b
+            }
+            Backend::VelloCpu => {
+                let mut b = render(document, w, h, false);
+                unpremultiply(&mut b);
+                b
+            }
+        }
+    }
+
+    /// A `width` x `height` frame of the page on white: what `fshot W H in.html out.png` writes.
+    fn frame(&mut self, document: &mut HtmlDocument, width: u32, height: u32) -> Vec<u8> {
+        match self.backend {
+            Backend::VelloGpu => {
+                let r = self.gpu.get_or_insert_with(|| anyrender_vello::VelloImageRenderer::new(width, height));
+                r.resize(width, height);
+                let mut v = Vec::new();
+                r.render_to_vec(
+                    |scene| {
+                        scene.fill(
+                            Fill::NonZero,
+                            Default::default(),
+                            Color::WHITE,
+                            Default::default(),
+                            &Rect::new(0.0, 0.0, width as f64, height as f64),
+                            AntiAliasing::Enabled,
+                        );
+                        paint_scene(scene, document.as_mut(), 1.0, width, height, 0, 0);
+                    },
+                    &mut v,
+                );
+                v
+            }
+            Backend::Skia => self.skia.get_or_insert_with(SkiaOffscreen::new).render(document, width, height, true),
+            Backend::VelloHybrid => {
+                self.hybrid.get_or_insert_with(|| HybridOffscreen::new(width, height)).render(document, width, height, true)
+            }
+            Backend::VelloCpu => render(document, width, height, true),
+        }
+    }
+
+    /// The pass `dump` paints to learn the paint order (64 x 64, thrown away). (wave 0) Skia's too, as every
+    /// picture is; another rasteriser only for a developer.
+    fn paint_order_pass(&mut self, document: &mut HtmlDocument) {
+        let _ = match self.backend {
+            Backend::Skia => self.skia.get_or_insert_with(SkiaOffscreen::new).render(document, 64, 64, false),
+            _ => render(document, 64, 64, false),
+        };
+    }
+}
+
 fn dump(input: &str, output: &str) {
     let mut document = load(input, VW, VH);
+    let out = dump_json(&mut document, &mut Painter::new(selected_backend()));
+    std::fs::write(output, out).unwrap();
+}
+
+/// What the painter logged in one paint-order pass over a page (blitz-paint's PAINT_LOG, SVG_LOG and SVG_PARTS):
+/// every element in paint order with its transform and boxes, each inline SVG's drawn bounds, and the object
+/// bounding box of each SVG part with an id.
+struct PaintOrder {
+    log: Vec<(NodeId, [f64; 6], f64, f64, [f64; 4])>,
+    svg: Vec<(NodeId, [f64; 4])>,
+    svg_parts: Vec<(NodeId, String, [f64; 4])>,
+}
+
+fn paint_order(document: &mut HtmlDocument, painter: &mut Painter) -> PaintOrder {
     *blitz_paint::PAINT_LOG.lock().unwrap() = Some(Vec::new());
     blitz_paint::SVG_LOG.lock().unwrap().clear();
     blitz_paint::SVG_PARTS.lock().unwrap().clear();
-    // (wave 0) the paint-order pass is Skia's too, as every picture is; another rasteriser only for a developer
-    let _ = match selected_backend() {
-        Backend::Skia => SkiaOffscreen::new().render(&mut document, 64, 64, false),
-        _ => render(&mut document, 64, 64, false),
-    };
-    let log = blitz_paint::PAINT_LOG.lock().unwrap().take().unwrap();
-    let svg_log = std::mem::take(&mut *blitz_paint::SVG_LOG.lock().unwrap());
+    painter.paint_order_pass(document);
+    PaintOrder {
+        log: blitz_paint::PAINT_LOG.lock().unwrap().take().unwrap(),
+        svg: std::mem::take(&mut *blitz_paint::SVG_LOG.lock().unwrap()),
+        svg_parts: std::mem::take(&mut *blitz_paint::SVG_PARTS.lock().unwrap()),
+    }
+}
+
+/// The text `fshot dump` writes for a laid-out page (the same bytes from `serve`'s `dump`: it is this function)
+fn dump_json(document: &mut HtmlDocument, painter: &mut Painter) -> String {
+    let PaintOrder { log, svg: svg_log, svg_parts } = paint_order(document, painter);
     let di = LocalName::from("data-i");
     let doc = document.as_ref();
     let mut out = String::from("{\"paint\":[");
@@ -724,7 +1058,7 @@ fn dump(input: &str, output: &str) {
     // known-future: the object bounding box of each SVG part with an id, as [svg's data-i, id, [x0, y0, x1, y1]]
     out.push_str("],\"svgparts\":[");
     let mut first = true;
-    for (id, part, bb) in std::mem::take(&mut *blitz_paint::SVG_PARTS.lock().unwrap()) {
+    for (id, part, bb) in svg_parts {
         let Some(i) = doc.get_node(id).and_then(|node| node.attr(di.clone())) else {
             continue;
         };
@@ -954,7 +1288,7 @@ fn dump(input: &str, output: &str) {
         .unwrap();
     }
     out.push_str("}}");
-    std::fs::write(output, out).unwrap();
+    out
 }
 
 /// known-future (outside round 6): `fshot boxes in1.html out1.json [in2.html out2.json ...]` lays each page out (no
@@ -971,114 +1305,171 @@ fn dump(input: &str, output: &str) {
 /// (display: none, on it or above it), 2 a non-atomic inline, 4 a CSS transform of its own, 8 box-sizing: border-box,
 /// 16 position: fixed. Pages are laid out one after another in one process at their own viewport size.
 fn boxes(pairs: &[String]) {
-    use peniko::kurbo::{Affine, Vec2};
-    let di = LocalName::from("data-i");
     for pair in pairs.chunks(2) {
         let (input, output) = (&pair[0], &pair[1]);
         let document = load(input, VW, VH);
-        let doc = document.as_ref();
-        let index = |id: NodeId| -> Option<String> { doc.get_node(id).and_then(|n| n.attr(di.clone()).map(|s| s.to_string())) };
-        // the affine from the page origin to the node's border box: each containing block's position, scroll and CSS
-        // transform, as the painter applies them (blitz-paint's node_transform), with the unrounded layout
-        fn chain(doc: &blitz_dom::BaseDocument, id: NodeId, depth: u32) -> Affine {
-            let Some(node) = doc.get_node(id) else { return Affine::IDENTITY };
-            let l = node.unrounded_layout().location;
-            let own = node.transform().as_deref().copied().unwrap_or_default();
-            let local = Affine::translate(Vec2::new(l.x as f64, l.y as f64)) * own;
-            match node.containing_block() {
-                Some(p) if depth < 4096 => {
-                    let (sx, sy) = doc.get_node(p).map(|n| (n.scroll_offset().x, n.scroll_offset().y)).unwrap_or((0.0, 0.0));
-                    chain(doc, p, depth + 1) * Affine::translate(Vec2::new(-sx, -sy)) * local
-                }
-                _ => local,
-            }
-        }
-        let fin = |v: f64| if v.is_finite() { v } else { 0.0 };
-        let mut out = String::from("{\"boxes\":[");
-        let mut first = true;
-        for (id, node) in doc.tree().iter() {
-            let Some(i) = node.attr(di.clone()) else { continue };
-            let Some(st) = node.primary_styles() else { continue };
-            let mut flags = 0u32;
-            let mut p = Some(id);
-            while let Some(q) = p {
-                let Some(n) = doc.get_node(q) else { break };
-                if n.element_data().is_some() && format!("{:?}", n.taffy_display()) == "None" {
-                    flags |= 1;
-                    break;
-                }
-                p = n.parent;
-            }
-            let inline = node.is_non_atomic_inline();
-            if inline {
-                flags |= 2;
-            }
-            if node.transform().is_some() && !inline {
-                flags |= 4;
-            }
-            if format!("{:?}", st.get_position().box_sizing) == "BorderBox" {
-                flags |= 8;
-            }
-            if format!("{:?}", st.get_box().position) == "Fixed" {
-                flags |= 16;
-            }
-            let l = *node.unrounded_layout();
-            let (rect, bounds, off, op) = if flags & 1 != 0 {
-                ([0.0; 4], [0.0; 4], [0.0; 4], -1i64)
-            } else {
-                let r = doc.get_client_bounding_rect(id).unwrap_or(blitz_dom::BoundingRect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 });
-                let o = doc.offset_rect(id).unwrap_or(blitz_dom::BoundingRect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 });
-                let op = match node.offset_parent() {
-                    _ if flags & 16 != 0 => -1,
-                    Some(pn) => index(pn.id).and_then(|s| s.parse::<i64>().ok()).unwrap_or(-2),
-                    None => -1,
-                };
-                let b = if inline {
-                    // the fragments are relative to the inline root's border box, under its transforms
-                    match (node.inline_fragment_boxes(), node.inline_root_ancestor()) {
-                        (Some(fr), Some(root)) => {
-                            let m = chain(doc, root.id, 0);
-                            let mut u: Option<Rect> = None;
-                            for f in fr {
-                                let q = m.transform_rect_bbox(Rect::new(f.left as f64, f.top as f64, f.right as f64, f.bottom as f64));
-                                u = Some(u.map_or(q, |a| a.union(q)));
-                            }
-                            u.map_or([0.0; 4], |u| [u.x0, u.y0, u.x1, u.y1])
-                        }
-                        _ => [r.x, r.y, r.x + r.width, r.y + r.height],
-                    }
-                } else {
-                    let q = chain(doc, id, 0).transform_rect_bbox(Rect::new(0.0, 0.0, l.size.width as f64, l.size.height as f64));
-                    [q.x0, q.y0, q.x1, q.y1]
-                };
-                ([r.x, r.y, r.width, r.height], b, [o.x, o.y, o.width, o.height], op)
-            };
-            let none = flags & 1 != 0;
-            let z = |v: f32| if none { 0.0 } else { v as f64 };
-            if !first {
-                out.push(',');
-            }
-            first = false;
-            write!(
-                out,
-                "[{},{},[{},{},{},{}],{},[{},{},{},{}],[{},{},{},{}],[{},{}],[{},{},{},{}],[{},{},{},{}],[{},{},{},{}],[{},{},{},{}]]",
-                i, flags,
-                fin(rect[0]), fin(rect[1]), fin(rect[2]), fin(rect[3]),
-                op,
-                fin(off[0]), fin(off[1]), fin(off[2]), fin(off[3]),
-                z(l.border.left), z(l.border.top), if none || inline { 0.0 } else { node.client_width() as f64 }, if none || inline { 0.0 } else { node.client_height() as f64 },
-                if none || inline { 0.0 } else { node.scroll_width() as f64 }, if none || inline { 0.0 } else { node.scroll_height() as f64 },
-                fin(bounds[0]), fin(bounds[1]), fin(bounds[2]), fin(bounds[3]),
-                z(l.padding.left), z(l.padding.top), z(l.padding.right), z(l.padding.bottom),
-                z(l.border.left), z(l.border.top), z(l.border.right), z(l.border.bottom),
-                z(l.margin.left), z(l.margin.top), z(l.margin.right), z(l.margin.bottom)
-            )
-            .unwrap();
-        }
-        let vp = doc.viewport().window_size;
-        write!(out, "],\"vp\":[{},{}]}}", vp.0, vp.1).unwrap();
-        std::fs::write(output, out).unwrap();
+        std::fs::write(output, boxes_json(document.as_ref())).unwrap();
     }
+}
+
+/// The boxes of one element that has computed styles, as `fshot boxes` lists them (the comment on `boxes` says
+/// what each is): `serve`'s `analyze` and `resolve` give the same numbers under their names.
+pub(crate) struct ElementBoxes {
+    /// 1 not rendered, 2 a non-atomic inline, 4 a CSS transform of its own, 8 box-sizing: border-box, 16 position: fixed
+    pub(crate) flags: u32,
+    /// the border box before transforms, document-relative: x, y, width, height
+    pub(crate) rect: [f64; 4],
+    /// its bounds under the CSS transforms of it and of its containing blocks: x0, y0, x1, y1
+    pub(crate) bounds: [f64; 4],
+    /// offsetLeft, offsetTop, offsetWidth, offsetHeight
+    pub(crate) offset: [f64; 4],
+    /// the offset parent (none for a fixed box, one that is not rendered, or one that has none)
+    pub(crate) offset_parent: Option<NodeId>,
+    /// clientLeft, clientTop, clientWidth, clientHeight
+    pub(crate) client: [f64; 4],
+    /// scrollWidth, scrollHeight
+    pub(crate) scroll: [f64; 2],
+    /// left, top, right, bottom
+    pub(crate) padding: [f64; 4],
+    pub(crate) border: [f64; 4],
+    pub(crate) margin: [f64; 4],
+}
+
+/// The affine from the page origin to a node's border box: each containing block's position, scroll and CSS
+/// transform, as the painter applies them (blitz-paint's node_transform), with the unrounded layout
+fn page_transform(doc: &blitz_dom::BaseDocument, id: NodeId, depth: u32) -> peniko::kurbo::Affine {
+    use peniko::kurbo::{Affine, Vec2};
+    let Some(node) = doc.get_node(id) else { return Affine::IDENTITY };
+    let l = node.unrounded_layout().location;
+    let own = node.transform().as_deref().copied().unwrap_or_default();
+    let local = Affine::translate(Vec2::new(l.x as f64, l.y as f64)) * own;
+    match node.containing_block() {
+        Some(p) if depth < 4096 => {
+            let (sx, sy) = doc.get_node(p).map(|n| (n.scroll_offset().x, n.scroll_offset().y)).unwrap_or((0.0, 0.0));
+            page_transform(doc, p, depth + 1) * Affine::translate(Vec2::new(-sx, -sy)) * local
+        }
+        _ => local,
+    }
+}
+
+pub(crate) fn element_boxes(doc: &blitz_dom::BaseDocument, id: NodeId, node: &blitz_dom::Node, st: &style::properties::ComputedValues) -> ElementBoxes {
+    let fin = |v: f64| if v.is_finite() { v } else { 0.0 };
+    let mut flags = 0u32;
+    let mut p = Some(id);
+    while let Some(q) = p {
+        let Some(n) = doc.get_node(q) else { break };
+        if n.element_data().is_some() && format!("{:?}", n.taffy_display()) == "None" {
+            flags |= 1;
+            break;
+        }
+        p = n.parent;
+    }
+    let inline = node.is_non_atomic_inline();
+    if inline {
+        flags |= 2;
+    }
+    if node.transform().is_some() && !inline {
+        flags |= 4;
+    }
+    if format!("{:?}", st.get_position().box_sizing) == "BorderBox" {
+        flags |= 8;
+    }
+    if format!("{:?}", st.get_box().position) == "Fixed" {
+        flags |= 16;
+    }
+    let l = *node.unrounded_layout();
+    let (rect, bounds, off, op) = if flags & 1 != 0 {
+        ([0.0; 4], [0.0; 4], [0.0; 4], None)
+    } else {
+        let r = doc.get_client_bounding_rect(id).unwrap_or(blitz_dom::BoundingRect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 });
+        let o = doc.offset_rect(id).unwrap_or(blitz_dom::BoundingRect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 });
+        let op = match node.offset_parent() {
+            _ if flags & 16 != 0 => None,
+            Some(pn) => Some(pn.id),
+            None => None,
+        };
+        let b = if inline {
+            // the fragments are relative to the inline root's border box, under its transforms
+            match (node.inline_fragment_boxes(), node.inline_root_ancestor()) {
+                (Some(fr), Some(root)) => {
+                    let m = page_transform(doc, root.id, 0);
+                    let mut u: Option<Rect> = None;
+                    for f in fr {
+                        let q = m.transform_rect_bbox(Rect::new(f.left as f64, f.top as f64, f.right as f64, f.bottom as f64));
+                        u = Some(u.map_or(q, |a| a.union(q)));
+                    }
+                    u.map_or([0.0; 4], |u| [u.x0, u.y0, u.x1, u.y1])
+                }
+                _ => [r.x, r.y, r.x + r.width, r.y + r.height],
+            }
+        } else {
+            let q = page_transform(doc, id, 0).transform_rect_bbox(Rect::new(0.0, 0.0, l.size.width as f64, l.size.height as f64));
+            [q.x0, q.y0, q.x1, q.y1]
+        };
+        ([r.x, r.y, r.width, r.height], b, [o.x, o.y, o.width, o.height], op)
+    };
+    let none = flags & 1 != 0;
+    let z = |v: f32| if none { 0.0 } else { v as f64 };
+    ElementBoxes {
+        flags,
+        rect: rect.map(fin),
+        bounds: bounds.map(fin),
+        offset: off.map(fin),
+        offset_parent: op,
+        client: [
+            z(l.border.left),
+            z(l.border.top),
+            if none || inline { 0.0 } else { node.client_width() as f64 },
+            if none || inline { 0.0 } else { node.client_height() as f64 },
+        ],
+        scroll: [
+            if none || inline { 0.0 } else { node.scroll_width() as f64 },
+            if none || inline { 0.0 } else { node.scroll_height() as f64 },
+        ],
+        padding: [z(l.padding.left), z(l.padding.top), z(l.padding.right), z(l.padding.bottom)],
+        border: [z(l.border.left), z(l.border.top), z(l.border.right), z(l.border.bottom)],
+        margin: [z(l.margin.left), z(l.margin.top), z(l.margin.right), z(l.margin.bottom)],
+    }
+}
+
+/// The text `fshot boxes` writes for a laid-out page (the same bytes from `serve`'s `boxes`)
+fn boxes_json(doc: &blitz_dom::BaseDocument) -> String {
+    let di = LocalName::from("data-i");
+    let index = |id: NodeId| -> Option<String> { doc.get_node(id).and_then(|n| n.attr(di.clone()).map(|s| s.to_string())) };
+    let mut out = String::from("{\"boxes\":[");
+    let mut first = true;
+    for (id, node) in doc.tree().iter() {
+        let Some(i) = node.attr(di.clone()) else { continue };
+        let Some(st) = node.primary_styles() else { continue };
+        let b = element_boxes(doc, id, node, &st);
+        // (the data-i of the offset parent, -1 for none, -2 for one without a data-i)
+        let op = match b.offset_parent {
+            Some(pid) => index(pid).and_then(|s| s.parse::<i64>().ok()).unwrap_or(-2),
+            None => -1,
+        };
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        write!(
+            out,
+            "[{},{},[{},{},{},{}],{},[{},{},{},{}],[{},{},{},{}],[{},{}],[{},{},{},{}],[{},{},{},{}],[{},{},{},{}],[{},{},{},{}]]",
+            i, b.flags,
+            b.rect[0], b.rect[1], b.rect[2], b.rect[3],
+            op,
+            b.offset[0], b.offset[1], b.offset[2], b.offset[3],
+            b.client[0], b.client[1], b.client[2], b.client[3],
+            b.scroll[0], b.scroll[1],
+            b.bounds[0], b.bounds[1], b.bounds[2], b.bounds[3],
+            b.padding[0], b.padding[1], b.padding[2], b.padding[3],
+            b.border[0], b.border[1], b.border[2], b.border[3],
+            b.margin[0], b.margin[1], b.margin[2], b.margin[3]
+        )
+        .unwrap();
+    }
+    let vp = doc.viewport().window_size;
+    write!(out, "],\"vp\":[{},{}]}}", vp.0, vp.1).unwrap();
+    out
 }
 
 /// Load one scene page once, then paint many pictures from it: per picture, swap the CSS inside
@@ -1090,105 +1481,23 @@ fn paintset(base: &str, jobfile: &str) {
     let t_all = Instant::now();
     let mut document = load(base, VW, VH);
     let t_first = t_all.elapsed().as_millis();
-    let di = LocalName::from("data-i");
-    let idn = LocalName::from("id");
-    let (mut style_text, mut by_i): (Option<NodeId>, std::collections::HashMap<String, NodeId>) =
-        (None, Default::default());
-    {
-        let doc = document.as_ref();
-        for (_, node) in doc.tree().iter() {
-            if let Some(i) = node.attr(di.clone()) {
-                by_i.insert(i.to_string(), node.id);
-            }
-            if node.attr(idn.clone()) == Some("fshot-pic") {
-                style_text = node.children.first().copied();
-            }
-        }
-    }
-    let style_text = style_text.expect("base page needs <style id=\"fshot-pic\">/**/</style>");
-    let mut gpu_renderer: Option<anyrender_vello::VelloImageRenderer> = None;
-    let mut skia_renderer: Option<SkiaOffscreen> = None;
-    let mut hybrid_renderer: Option<HybridOffscreen> = None;
+    let page = PaintsetPage::of(document.as_ref()).expect("base page needs <style id=\"fshot-pic\">/**/</style>");
+    let mut painter = Painter::new(backend);
     let (mut t_restyle, mut t_paint, mut t_write, mut n) = (0u128, 0u128, 0u128, 0);
     let jobs = std::fs::read_to_string(jobfile).unwrap();
-    for rec in jobs.split("\u{1e}\n") {
-        if rec.trim().is_empty() {
-            continue;
-        }
-        let (head, css) = rec.split_once("\n---\n").unwrap();
-        let mut lines = head.lines();
-        let first: Vec<&str> = lines.next().unwrap().split(' ').collect();
-        let (output, w, h) = (
-            first[0],
-            first[1].parse::<u32>().unwrap(),
-            first[2].parse::<u32>().unwrap(),
-        );
+    for rec in paintset_records(&jobs) {
+        let rec = rec.unwrap();
         let t0 = Instant::now();
-        let mut restore: Vec<(NodeId, QualName, Option<String>)> = Vec::new();
-        {
-            let mut m = document.as_mut().mutate();
-            m.set_node_text(style_text, css);
-            for l in lines {
-                let mut it = l.splitn(4, ' ');
-                let (_, i, attr, value) = (
-                    it.next(),
-                    it.next().unwrap(),
-                    it.next().unwrap(),
-                    it.next().unwrap_or(""),
-                );
-                let id = by_i[i];
-                let q = QualName::new(None, ns!(), LocalName::from(attr));
-                restore.push((id, q.clone(), None));
-                m.set_attribute(id, q, value);
-            }
-        }
+        let restore = page.apply(&mut document, &rec).unwrap();
         document.as_mut().resolve(0.0);
         t_restyle += t0.elapsed().as_millis();
         let t1 = Instant::now();
-        let mut buf = match backend {
-            Backend::VelloGpu => {
-                let r = gpu_renderer
-                    .get_or_insert_with(|| anyrender_vello::VelloImageRenderer::new(w, h));
-                r.resize(w, h);
-                let mut v = Vec::new();
-                r.render_to_vec(
-                    |scene| paint_scene(scene, document.as_mut(), 1.0, w, h, 0, 0),
-                    &mut v,
-                );
-                v
-            }
-            Backend::Skia => {
-                let r = skia_renderer.get_or_insert_with(SkiaOffscreen::new);
-                let mut b = r.render(&mut document, w, h, false);
-                unpremultiply(&mut b);
-                b
-            }
-            Backend::VelloHybrid => {
-                let r = hybrid_renderer.get_or_insert_with(|| HybridOffscreen::new(w, h));
-                let mut b = r.render(&mut document, w, h, false);
-                unpremultiply(&mut b);
-                b
-            }
-            Backend::VelloCpu => {
-                let mut b = render(&mut document, w, h, false);
-                unpremultiply(&mut b);
-                b
-            }
-        };
+        let mut buf = painter.picture(&mut document, rec.w, rec.h);
         t_paint += t1.elapsed().as_millis();
         let t2 = Instant::now();
-        if output.ends_with(".rgba") {
-            std::fs::write(output, &buf).unwrap();
-        } else {
-            write_png(output, &mut buf, w, h);
-        }
+        write_picture(rec.output, &mut buf, rec.w, rec.h);
         t_write += t2.elapsed().as_millis();
-        if !restore.is_empty() {
-            let mut m = document.as_mut().mutate();
-            for (id, q, _) in restore {
-                m.clear_attribute(id, q);
-            }
-        }
+        PaintsetPage::clear(&mut document, restore);
         n += 1;
     }
     println!(
@@ -1200,6 +1509,92 @@ fn paintset(base: &str, jobfile: &str) {
         t_write,
         t_all.elapsed().as_millis()
     );
+}
+
+/// One picture of a `paintset` job file: where it goes, its size, the attributes it sets and its CSS
+struct PaintsetRecord<'a> {
+    output: &'a str,
+    w: u32,
+    h: u32,
+    /// (data-i, attribute, value)
+    attrs: Vec<(&'a str, &'a str, &'a str)>,
+    css: &'a str,
+}
+
+/// The records of a `paintset` job file, in order (the format is on `paintset`); one that is not in that format
+/// is an `Err` that says what is missing.
+fn paintset_records(jobs: &str) -> impl Iterator<Item = Result<PaintsetRecord<'_>, String>> {
+    jobs.split("\u{1e}\n").filter(|rec| !rec.trim().is_empty()).map(|rec| {
+        let (head, css) = rec.split_once("\n---\n").ok_or("a record has no line \"---\" before its CSS")?;
+        let mut lines = head.lines();
+        let first: Vec<&str> = lines.next().ok_or("a record has no \"OUT W H\" line")?.split(' ').collect();
+        let size = |k: usize| first.get(k).and_then(|v| v.parse::<u32>().ok()).ok_or_else(|| format!("\"{}\" is not \"OUT W H\"", first.join(" ")));
+        let (w, h) = (size(1)?, size(2)?);
+        let mut attrs = Vec::new();
+        for l in lines {
+            let mut it = l.splitn(4, ' ');
+            let (_, i, attr, value) = (
+                it.next(),
+                it.next().ok_or_else(|| format!("\"{l}\" is not \"@ <data-i> <attr> <value>\""))?,
+                it.next().ok_or_else(|| format!("\"{l}\" is not \"@ <data-i> <attr> <value>\""))?,
+                it.next().unwrap_or(""),
+            );
+            attrs.push((i, attr, value));
+        }
+        Ok(PaintsetRecord { output: first[0], w, h, attrs, css })
+    })
+}
+
+/// What `paintset` changes in its base page: the text of <style id="fshot-pic"> and the elements by `data-i`
+struct PaintsetPage {
+    style_text: NodeId,
+    by_i: std::collections::HashMap<String, NodeId>,
+}
+
+impl PaintsetPage {
+    /// `None` for a page without <style id="fshot-pic"> (with a text in it: `/**/`)
+    fn of(doc: &blitz_dom::BaseDocument) -> Option<Self> {
+        let di = LocalName::from("data-i");
+        let idn = LocalName::from("id");
+        let (mut style_text, mut by_i): (Option<NodeId>, std::collections::HashMap<String, NodeId>) = (None, Default::default());
+        for (_, node) in doc.tree().iter() {
+            if let Some(i) = node.attr(di.clone()) {
+                by_i.insert(i.to_string(), node.id);
+            }
+            if node.attr(idn.clone()) == Some("fshot-pic") {
+                style_text = node.children.first().copied();
+            }
+        }
+        Some(PaintsetPage { style_text: style_text?, by_i })
+    }
+
+    /// Put a picture's CSS and attributes into the page (not yet resolved); the attributes set are returned, to
+    /// be cleared after the picture. Nothing is changed when the record names an element the page has not.
+    fn apply(&self, document: &mut HtmlDocument, rec: &PaintsetRecord) -> Result<Vec<(NodeId, QualName)>, String> {
+        let mut set: Vec<(NodeId, QualName, &str)> = Vec::new();
+        for (i, attr, value) in &rec.attrs {
+            let id = *self.by_i.get(*i).ok_or_else(|| format!("the page has no element with data-i=\"{i}\""))?;
+            set.push((id, QualName::new(None, ns!(), LocalName::from(*attr)), value));
+        }
+        let mut m = document.as_mut().mutate();
+        m.set_node_text(self.style_text, rec.css);
+        let mut restore = Vec::new();
+        for (id, q, value) in set {
+            restore.push((id, q.clone()));
+            m.set_attribute(id, q, value);
+        }
+        Ok(restore)
+    }
+
+    /// After a picture: the attributes it set are removed (the CSS stays until the next picture replaces it)
+    fn clear(document: &mut HtmlDocument, restore: Vec<(NodeId, QualName)>) {
+        if !restore.is_empty() {
+            let mut m = document.as_mut().mutate();
+            for (id, q) in restore {
+                m.clear_attribute(id, q);
+            }
+        }
+    }
 }
 
 fn main() {
@@ -1225,11 +1620,9 @@ fn main() {
         "dump" => dump(&args[2], &args[3]),
         "boxes" => boxes(&args[2..]),
         "paintset" => paintset(&args[2], &args[3]),
+        "serve" => serve::serve(),
         "paint" => {
-            let backend = selected_backend();
-            let mut gpu_renderer: Option<anyrender_vello::VelloImageRenderer> = None;
-            let mut skia_renderer: Option<SkiaOffscreen> = None;
-            let mut hybrid_renderer: Option<HybridOffscreen> = None;
+            let mut painter = Painter::new(selected_backend());
             let (mut t_load, mut t_paint, mut t_write) = (0u128, 0u128, 0u128);
             let t_all = Instant::now();
             for spec in &args[2..] {
@@ -1240,43 +1633,10 @@ fn main() {
                 let mut document = load(input, VW, VH);
                 t_load += t0.elapsed().as_millis();
                 let t1 = Instant::now();
-                let mut buf = match backend {
-                    Backend::VelloGpu => {
-                        let r = gpu_renderer
-                            .get_or_insert_with(|| anyrender_vello::VelloImageRenderer::new(w, h));
-                        r.resize(w, h);
-                        let mut v = Vec::new();
-                        r.render_to_vec(
-                            |scene| paint_scene(scene, document.as_mut(), 1.0, w, h, 0, 0),
-                            &mut v,
-                        );
-                        v
-                    }
-                    Backend::Skia => {
-                        let r = skia_renderer.get_or_insert_with(SkiaOffscreen::new);
-                        let mut b = r.render(&mut document, w, h, false);
-                        unpremultiply(&mut b);
-                        b
-                    }
-                    Backend::VelloHybrid => {
-                        let r = hybrid_renderer.get_or_insert_with(|| HybridOffscreen::new(w, h));
-                        let mut b = r.render(&mut document, w, h, false);
-                        unpremultiply(&mut b);
-                        b
-                    }
-                    Backend::VelloCpu => {
-                        let mut b = render(&mut document, w, h, false);
-                        unpremultiply(&mut b);
-                        b
-                    }
-                };
+                let mut buf = painter.picture(&mut document, w, h);
                 t_paint += t1.elapsed().as_millis();
                 let t2 = Instant::now();
-                if output.ends_with(".rgba") {
-                    std::fs::write(output, &buf).unwrap();
-                } else {
-                    write_png(output, &mut buf, w, h);
-                }
+                write_picture(output, &mut buf, w, h);
                 t_write += t2.elapsed().as_millis();
                 println!("{output} {w}x{h} {} ms", t0.elapsed().as_millis());
             }
@@ -1290,50 +1650,14 @@ fn main() {
             );
         }
         _ => {
-            let backend = selected_backend();
+            let mut painter = Painter::new(selected_backend());
             let width: u32 = args[1].parse().unwrap();
             let height: u32 = args[2].parse().unwrap();
-            let mut gpu_renderer: Option<anyrender_vello::VelloImageRenderer> = None;
-            let mut skia_renderer: Option<SkiaOffscreen> = None;
-            let mut hybrid_renderer: Option<HybridOffscreen> = None;
             for pair in args[3..].chunks(2) {
                 let t0 = Instant::now();
                 let mut document = load(&pair[0], width, height);
                 let t_layout = t0.elapsed().as_millis();
-                let mut buf = match backend {
-                    Backend::VelloGpu => {
-                        let r = gpu_renderer.get_or_insert_with(|| {
-                            anyrender_vello::VelloImageRenderer::new(width, height)
-                        });
-                        r.resize(width, height);
-                        let mut v = Vec::new();
-                        r.render_to_vec(
-                            |scene| {
-                                scene.fill(
-                                    Fill::NonZero,
-                                    Default::default(),
-                                    Color::WHITE,
-                                    Default::default(),
-                                    &Rect::new(0.0, 0.0, width as f64, height as f64),
-                                    AntiAliasing::Enabled,
-                                );
-                                paint_scene(scene, document.as_mut(), 1.0, width, height, 0, 0);
-                            },
-                            &mut v,
-                        );
-                        v
-                    }
-                    Backend::Skia => {
-                        let r = skia_renderer.get_or_insert_with(SkiaOffscreen::new);
-                        r.render(&mut document, width, height, true)
-                    }
-                    Backend::VelloHybrid => {
-                        let r =
-                            hybrid_renderer.get_or_insert_with(|| HybridOffscreen::new(width, height));
-                        r.render(&mut document, width, height, true)
-                    }
-                    Backend::VelloCpu => render(&mut document, width, height, true),
-                };
+                let mut buf = painter.frame(&mut document, width, height);
                 let t_paint = t0.elapsed().as_millis() - t_layout;
                 write_png(&pair[1], &mut buf, width, height);
                 println!(
@@ -1342,5 +1666,104 @@ fn main() {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_pages_own_frame_size_and_base_url() {
+        let page = "<html><head><meta name=\"fshot-viewport\" content=\"800x600\"><base href=\"file:///proj/\"></head><body></body></html>";
+        assert_eq!(page_viewport(page), Some((800, 600)));
+        assert_eq!(page_base_url(page, || "file:///own.html".into()), "file:///proj/");
+        let plain = "<html><head></head><body><meta name=\"fshot-viewport\" content=\"1x1\"></body></html>";
+        assert_eq!(page_viewport(plain), None, "only a <meta> of the head counts");
+        assert_eq!(page_base_url(plain, || "file:///own.html".into()), "file:///own.html");
+        assert_eq!(page_viewport("<head><meta name=\"fshot-viewport\" content=\"0x600\"></head>"), None);
+        assert!(page_wants_chrome_generics("<head><meta name=\"fshot-generics\" content=\"chrome\"></head>"));
+        assert!(!page_wants_chrome_generics(plain));
+    }
+
+    #[test]
+    fn paintset_job_files() {
+        let jobs = "a.png 320 200\n---\n/**/\n\u{1e}\nb.rgba 64 32\n@ 13 transform translate(6 4)\n@ 12 fill\n---\n.x{opacity:.5}\n.y{}\n";
+        let recs: Vec<PaintsetRecord> = paintset_records(jobs).collect::<Result<_, _>>().unwrap();
+        assert_eq!(recs.len(), 2);
+        assert_eq!((recs[0].output, recs[0].w, recs[0].h, recs[0].attrs.len(), recs[0].css), ("a.png", 320, 200, 0, "/**/\n"));
+        assert_eq!((recs[1].output, recs[1].w, recs[1].h), ("b.rgba", 64, 32));
+        assert_eq!(recs[1].attrs, vec![("13", "transform", "translate(6 4)"), ("12", "fill", "")]);
+        assert_eq!(recs[1].css, ".x{opacity:.5}\n.y{}\n");
+        // a record that is not in the format is said to be, not a panic
+        for bad in ["a.png 320 200\n/**/\n", "a.png 320\n---\n/**/\n", "a.png x 200\n---\n/**/\n", "a.png 1 1\n@ 13\n---\n/**/\n"] {
+            assert!(paintset_records(bad).next().unwrap().is_err(), "{bad:?}");
+        }
+        assert_eq!(paintset_records("\n  \n").count(), 0);
+    }
+
+    #[test]
+    fn json_strings_are_json() {
+        assert_eq!(json_string("a\"b\\c\n\u{1}\u{2028}d"), "\"a\\\"b\\\\c\\u000a\\u0001\\u2028d\"");
+        assert_eq!(analyze::num(1.5), "1.5");
+        assert_eq!(analyze::num(f64::NAN), "null");
+        assert_eq!(analyze::num(f64::INFINITY), "null");
+        assert_eq!(analyze::nums(&[0.0, -2.25, 1920.0]), "[0,-2.25,1920]");
+    }
+
+    #[test]
+    fn the_properties_a_request_names() {
+        blitz_dom::BaseDocument::init_style_prefs();
+        let props = analyze::Props::parse(["opacity", " Mask-Image ", "overflow", "--tint", "opacity", "no-such-property", "--Tint"]);
+        assert_eq!(props.names, ["opacity", "mask-image", "overflow", "--tint", "--Tint"]);
+        assert_eq!(props.unsupported, ["no-such-property"]);
+        // every property of the default lists is one the style engine has, but those said not to be
+        let defaults = analyze::Props::parse(analyze::DEFAULT_PROPS.iter().copied());
+        assert_eq!(defaults.unsupported, ["content-visibility", "transform-box", "offset-distance"]);
+        for name in ["mask-image", "clip-path", "filter", "backdrop-filter", "opacity", "mix-blend-mode", "background-blend-mode", "transform",
+            "transform-origin", "perspective", "transform-style", "backface-visibility", "overflow-x", "overflow-y", "visibility", "display", "position", "z-index"]
+        {
+            assert!(defaults.names.iter().any(|n| n == name), "{name}");
+        }
+        assert!(analyze::Props::parse(analyze::DEFAULT_USED.iter().copied()).unsupported.is_empty());
+        assert!(analyze::Props::all().len() > 150);
+    }
+
+    #[test]
+    fn a_folder_of_fshot_docroot() {
+        let dir = std::env::temp_dir().join(format!("fshot-docroot-test-{}", std::process::id()));
+        let (root, outside) = (dir.join("root"), dir.join("outside"));
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(root.join("in.txt"), b"inside").unwrap();
+        std::fs::write(outside.join("secret.txt"), b"secret").unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(outside.join("secret.txt"), root.join("link_out.txt")).unwrap();
+            std::os::unix::fs::symlink(root.join("in.txt"), root.join("link_in.txt")).unwrap();
+            std::os::unix::fs::symlink(&outside, root.join("dir_out")).unwrap();
+        }
+        let docroot = Docroot { roots: vec![std::fs::canonicalize(&root).unwrap()] };
+        let url = |p: &Path| url::Url::from_file_path(p).unwrap();
+        assert_eq!(&docroot.read(&url(&root.join("in.txt"))).ok().unwrap()[..], b"inside");
+        assert_eq!(&docroot.read(&url(&root.join("sub/../in.txt"))).ok().unwrap()[..], b"inside");
+        #[cfg(unix)]
+        assert_eq!(&docroot.read(&url(&root.join("link_in.txt"))).ok().unwrap()[..], b"inside");
+        let refused = |p: PathBuf| match docroot.read(&url(&p)) {
+            Ok(_) => panic!("{} was read", p.display()),
+            Err(e) => e.outside,
+        };
+        assert!(refused(outside.join("secret.txt")));
+        assert!(refused(root.join("../outside/secret.txt")));
+        #[cfg(unix)]
+        {
+            assert!(refused(root.join("link_out.txt")));
+            assert!(refused(root.join("dir_out/secret.txt")));
+        }
+        assert!(refused(outside.join("nothing.txt")), "a file that is not there, outside: refused as outside");
+        assert!(!refused(root.join("nothing.txt")), "a file that is not there, inside: not there");
+        assert!(!refused(root.join("sub")), "a folder is no file");
+        assert!(docroot.read(&url::Url::parse("data:text/plain,x").unwrap()).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
