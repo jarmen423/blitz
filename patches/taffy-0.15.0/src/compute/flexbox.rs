@@ -46,6 +46,13 @@ struct FlexItem {
     max_size: Size<Option<f32>>,
     /// The aspect ratio of this item
     aspect_ratio: Option<f32>,
+    /// known-future (wave 2, fix round 1): what the item's size styles leave out of its border box:
+    /// padding + border in each axis with `box-sizing: content-box`, otherwise zero. The item's
+    /// `size`, `min_size` and `max_size` are border-box sizes (it is already added to them), and its
+    /// `aspect_ratio` relates the dimensions of the box that `box-sizing` names, so a border-box
+    /// dimension goes through the ratio less this and comes out with it added back
+    /// (see [`Size::maybe_apply_aspect_ratio_to_border_box`]).
+    box_sizing_adjustment: Size<f32>,
     /// The cross-alignment of this item
     align_self: AlignSelf,
 
@@ -120,13 +127,28 @@ struct FlexItem {
 }
 
 impl FlexItem {
-    /// The size that the item's size styles exclude: padding + border for `box-sizing: content-box`, otherwise zero
-    fn box_sizing_adjustment(&self, style: &impl CoreStyle) -> Size<f32> {
-        if style.box_sizing() == BoxSizing::ContentBox {
-            (self.padding + self.border).sum_axes()
-        } else {
-            Size::ZERO
-        }
+    /// known-future (wave 2, fix round 1): the item's main size (a border-box size) that its aspect
+    /// ratio gives for the border-box cross size `cross`: the ratio relates the dimensions of the box
+    /// that `box-sizing` names, so with `content-box` the padding and border are taken off the cross
+    /// size before the ratio is applied and added to the main size it gives. A row item stretched to
+    /// 120px with `aspect-ratio: 2/1`, 25px of padding and 5px of border above and below and 5px of
+    /// border on each side is 130px wide (60px of content high, 120px of content wide), not 240px.
+    fn main_size_from_cross(&self, dir: FlexDirection, cross: f32) -> Option<f32> {
+        let ratio = self.aspect_ratio?;
+        let adj = self.box_sizing_adjustment;
+        let content_cross = (cross - adj.cross(dir)).max(0.0);
+        Some((if dir.is_row() { content_cross * ratio } else { content_cross / ratio }) + adj.main(dir))
+    }
+
+    /// known-future (wave 2, fix round 1): `min_size` with the dimension it leaves out given by the
+    /// aspect ratio (a minimum transferred through it), as border-box sizes
+    fn transferred_min_size(&self) -> Size<Option<f32>> {
+        self.min_size.maybe_apply_aspect_ratio_to_border_box(self.aspect_ratio, self.box_sizing_adjustment)
+    }
+
+    /// known-future (wave 2, fix round 1): [`Self::transferred_min_size`] for `max_size`
+    fn transferred_max_size(&self) -> Size<Option<f32>> {
+        self.max_size.maybe_apply_aspect_ratio_to_border_box(self.aspect_ratio, self.box_sizing_adjustment)
     }
 
     /// Returns true if the item is a <https://www.w3.org/TR/css-overflow-3/#scroll-container>
@@ -885,6 +907,7 @@ fn generate_anonymous_flex_items(
                     .maybe_resolve(percent_resolution_size, |val, basis| tree.calc(val, basis))
                     .maybe_add(box_sizing_adjustment),
                 aspect_ratio,
+                box_sizing_adjustment,
 
                 relative_inset: if child_style.position() == Position::Relative {
                     let inset = child_style.inset().zip_size(constants.node_inner_size, |p, s| {
@@ -1020,8 +1043,9 @@ fn determine_flex_base_size(
         // Available space for child sizing (excluding the child's margins)
         // Min/max sizes transferred through the aspect ratio are taken into account here
         // https://github.com/w3c/csswg-drafts/issues/10997
-        let transferred_min_size = child.min_size.maybe_apply_aspect_ratio(child.aspect_ratio);
-        let transferred_max_size = child.max_size.maybe_apply_aspect_ratio(child.aspect_ratio);
+        // (known-future, wave 2, fix round 1: through the ratio of the box that `box-sizing` names)
+        let transferred_min_size = child.transferred_min_size();
+        let transferred_max_size = child.transferred_max_size();
         let child_min_cross = transferred_min_size.cross(dir);
         let child_max_cross = transferred_max_size.cross(dir);
 
@@ -1068,7 +1092,7 @@ fn determine_flex_base_size(
             ckd
         };
 
-        let box_sizing_adjustment = child.box_sizing_adjustment(&child_style).main(dir);
+        let box_sizing_adjustment = child.box_sizing_adjustment.main(dir);
         // Percentage flex basis values resolve against the container's inner main size, but only
         // if that size is definite. A known main size which is derived from the container's own
         // content is treated as indefinite here.
@@ -1165,9 +1189,12 @@ fn determine_flex_base_size(
             // is calculated by transferring that cross size through the aspect ratio (case B
             // above), and is therefore definite.
             if child_cross_size_is_definite {
-                if let (Some(ratio), Some(cross)) = (child.aspect_ratio, child_known_dimensions.cross(dir)) {
+                // (known-future, wave 2, fix round 1: the cross size is a border-box size; with
+                // `box-sizing: content-box` the ratio is the content box's)
+                if let Some(main) = child_known_dimensions.cross(dir).and_then(|cross| child.main_size_from_cross(dir, cross))
+                {
                     child.flex_basis_is_definite = true;
-                    break 'flex_basis if dir.is_row() { cross * ratio } else { cross / ratio };
+                    break 'flex_basis main;
                 }
             }
 
@@ -1656,10 +1683,10 @@ fn determine_container_main_size(
                                     // Clamp the definite cross size by the cross min/max sizes, as
                                     // `determine_flex_base_size` does: an item measured wider than its
                                     // max-width wraps onto fewer lines and under-reports its height.
-                                    let transferred_min_size =
-                                        item.min_size.maybe_apply_aspect_ratio(item.aspect_ratio);
-                                    let transferred_max_size =
-                                        item.max_size.maybe_apply_aspect_ratio(item.aspect_ratio);
+                                    // (known-future, wave 2, fix round 1: through the ratio of the
+                                    // box that `box-sizing` names)
+                                    let transferred_min_size = item.transferred_min_size();
+                                    let transferred_max_size = item.transferred_max_size();
                                     ckd.set_cross(
                                         dir,
                                         ckd.cross(dir).maybe_clamp(
@@ -1688,10 +1715,11 @@ fn determine_container_main_size(
 
                                 // A known cross size is transferred through the item's aspect-ratio
                                 // and floors the measured content size
-                                let transferred_main_size = item
-                                    .aspect_ratio
-                                    .zip(child_known_dimensions.cross(dir))
-                                    .map(|(ratio, cross)| if constants.is_row { cross * ratio } else { cross / ratio });
+                                // (known-future, wave 2, fix round 1: as a border-box size, see
+                                // `FlexItem::main_size_from_cross`)
+                                let transferred_main_size = child_known_dimensions
+                                    .cross(dir)
+                                    .and_then(|cross| item.main_size_from_cross(dir, cross));
 
                                 let inner_main_size = measured_main_size.maybe_max(transferred_main_size);
 
@@ -2030,8 +2058,9 @@ fn determine_hypothetical_cross_size(
 
         // Sizes transferred through the aspect ratio clamp the hypothetical cross size
         // https://github.com/w3c/csswg-drafts/issues/10997
-        let transferred_min_cross = child.min_size.maybe_apply_aspect_ratio(child.aspect_ratio).cross(constants.dir);
-        let transferred_max_cross = child.max_size.maybe_apply_aspect_ratio(child.aspect_ratio).cross(constants.dir);
+        // (known-future, wave 2, fix round 1: through the ratio of the box that `box-sizing` names)
+        let transferred_min_cross = child.transferred_min_size().cross(constants.dir);
+        let transferred_max_cross = child.transferred_max_size().cross(constants.dir);
 
         let child_cross = child
             .size
@@ -2303,7 +2332,7 @@ fn determine_used_cross_size(
                     // a reasonable interpretation. Although it seems to me that the spec *should* apply aspect_ratio here.
                     // Percentage padding and border resolve against the container's inline size
                     // (its width) on all four sides, not against its height for the top/bottom sides
-                    let box_sizing_adjustment = child.box_sizing_adjustment(&child_style);
+                    let box_sizing_adjustment = child.box_sizing_adjustment;
 
                     let max_size_ignoring_aspect_ratio = child_style
                         .max_size()
