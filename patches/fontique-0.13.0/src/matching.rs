@@ -20,17 +20,25 @@ pub(crate) fn match_fonts(
         let font = &set[index];
         (font.width(), font.style(), font.weight(), font.weight_max())
     });
-    set.iter().enumerate().filter_map(move |(index, font)| {
-        let (best_width, best_style, best_weight, best_weight_max) = best?;
-        // We need to return each font with the best attributes, as there might be multiple subsets.
-        // (known-future, outside round 5: with the same weight range too, so a static face is not taken for a subset of
-        // a variable face whose range starts at its weight)
-        (font.width() == best_width
-            && font.style() == best_style
-            && font.weight() == best_weight
-            && font.weight_max() == best_weight_max)
-            .then_some(index)
-    })
+    let mut indices: SmallVec<[usize; 4]> = set
+        .iter()
+        .enumerate()
+        .filter_map(move |(index, font)| {
+            let (best_width, best_style, best_weight, best_weight_max) = best?;
+            // We need to return each font with the best attributes, as there might be multiple subsets.
+            // (known-future, outside round 5: with the same weight range too, so a static face is not taken for a
+            // subset of a variable face whose range starts at its weight)
+            (font.width() == best_width
+                && font.style() == best_style
+                && font.weight() == best_weight
+                && font.weight_max() == best_weight_max)
+                .then_some(index)
+        })
+        .collect();
+    // known-future (wave 2): the faces of `@font-face` rules are tried from the last rule to the first (CSS Fonts 4,
+    // 5.2), whatever order their files arrived in; faces that no rule declares keep the order they were added in
+    indices.sort_by(|a, b| set[*b].css_order().cmp(&set[*a].css_order()));
+    indices.into_iter()
 }
 
 pub fn match_font(

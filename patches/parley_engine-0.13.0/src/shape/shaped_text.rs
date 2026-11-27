@@ -391,6 +391,36 @@ impl ShapedText {
         let units_per_em = metrics.units_per_em as f32;
         let font_metrics = FontMetrics::from_skrifa_metrics(&metrics, options.font_size);
 
+        // known-future (wave 2): the glyphs' own advance widths, for `whole_pixel_advances`
+        let whole_pixel = options.whole_pixel_advances;
+        let glyph_metrics = whole_pixel.then(|| {
+            let font = &self.fonts[font_index];
+            let font_ref =
+                skrifa::FontRef::from_index(font.font.data.as_ref(), font.font.index).unwrap();
+            skrifa::metrics::GlyphMetrics::new(
+                &font_ref,
+                skrifa::prelude::Size::unscaled(),
+                normalized_coords,
+            )
+        });
+        // What giving a glyph its hinted advance width adds to the advance the shaper worked out
+        // from the unhinted one. Blink asks Skia for the width, and with hinting on and no
+        // sub-pixel positioning that is FreeType's: the width in font units scaled in 26.6 fixed
+        // point and rounded to a whole pixel there (`FT_PIX_ROUND`), so that 19.494px, which is
+        // 1247.6/64 and scales to 1248/64 = 19.5px, is 20px and not 19.
+        let scale_factor_for_rounding = options.font_size / units_per_em;
+        let font_size_for_rounding = options.font_size;
+        let advance_rounding = |glyph_id: u32| -> f32 {
+            let Some(glyph_metrics) = &glyph_metrics else {
+                return 0.;
+            };
+            let Some(width) = glyph_metrics.advance_width(skrifa::GlyphId::new(glyph_id)) else {
+                return 0.;
+            };
+            let hinted = hinted_advance_width(width, font_size_for_rounding, units_per_em);
+            hinted - width * scale_factor_for_rounding
+        };
+
         // `HarfRust` returns glyphs in visual order, so we need to process them as such while
         // maintaining logical ordering of clusters.
 
@@ -437,6 +467,8 @@ impl ShapedText {
                 &self.characters,
                 characters_start,
                 self.has_safe_to_concat_flags,
+                &advance_rounding,
+                whole_pixel,
             );
         } else {
             process_shaped_clusters(
@@ -448,6 +480,8 @@ impl ShapedText {
                 &self.characters,
                 characters_start,
                 self.has_safe_to_concat_flags,
+                &advance_rounding,
+                whole_pixel,
             );
             // Reverse each cluster's glyphs, such that they are in paint order.
             //
@@ -531,6 +565,10 @@ pub struct ShapedRun {
 /// * `characters_start` - See `characters`.
 /// * `produce_safe_to_concat_flags` - Whether `HarfRust` was asked to produce the unsafe-to-concat
 ///   glyph flags.
+/// * `advance_rounding` - What is added to the advance of the glyph with the given id (known-future:
+///   [`ShapeOptions::whole_pixel_advances`]).
+/// * `whole_pixel` - Whether advances and offsets are rounded to whole pixels (the same option).
+#[expect(clippy::too_many_arguments, reason = "known-future: two more")]
 fn process_shaped_clusters<'a>(
     shaped_clusters: &mut Vec<ShapedCluster>,
     glyphs: &mut Vec<Glyph>,
@@ -540,6 +578,8 @@ fn process_shaped_clusters<'a>(
     characters: &[Character],
     characters_start: usize,
     produce_safe_to_concat_flags: bool,
+    advance_rounding: &dyn Fn(u32) -> f32,
+    whole_pixel: bool,
 ) {
     struct Cluster {
         id: u32,
@@ -641,13 +681,22 @@ fn process_shaped_clusters<'a>(
                 produce_safe_to_concat_flags && !glyph_info.unsafe_to_concat();
         }
 
-        let glyph = Glyph {
+        let mut glyph = Glyph {
             id: glyph_info.glyph_id,
             x: (glyph_pos.x_offset as f32) * scale_factor,
             // Convert from font space (Y-up) to layout space (Y-down)
             y: -(glyph_pos.y_offset as f32) * scale_factor,
-            advance: (glyph_pos.x_advance as f32) * scale_factor,
+            // (known-future, wave 2: with the glyph's hinted advance width, see `push_run`)
+            advance: (glyph_pos.x_advance as f32) * scale_factor
+                + advance_rounding(glyph_info.glyph_id),
         };
+        if whole_pixel {
+            // known-future (wave 2): Blink rounds what shaping gave to whole pixels, half up, in
+            // the shaper's own (y-up) space
+            glyph.x = round_half_up(glyph.x);
+            glyph.y = -round_half_up(-glyph.y);
+            glyph.advance = round_half_up(glyph.advance);
+        }
         if cluster.glyphs == 0 && glyph.x == 0. && glyph.y == 0. {
             // Defer this potential zero-offset, single glyph cluster
             cluster.inline_glyph = Some(glyph);
@@ -663,6 +712,36 @@ fn process_shaped_clusters<'a>(
 
     // Flush the final cluster.
     flush(&mut cluster, characters.len(), characters, shaped_clusters);
+}
+
+/// known-future (wave 2): `floor(value + 0.5)`, without `f32::floor` (the crate is `no_std`).
+fn round_half_up(value: f32) -> f32 {
+    let shifted = value + 0.5;
+    let truncated = shifted as i64 as f32;
+    if truncated > shifted { truncated - 1. } else { truncated }
+}
+
+/// known-future (wave 2): the advance width FreeType gives a glyph of `width` font units at
+/// `font_size` pixels per em when it hints (`FT_LOAD_TARGET_LIGHT` included): the size and the
+/// scale are 26.6 and 16.16 fixed-point numbers, each rounded to nearest, and the scaled width
+/// is then rounded to a whole pixel (`FT_PIX_ROUND`, half up).
+pub fn hinted_advance_width(width: f32, font_size: f32, units_per_em: f32) -> f32 {
+    if !(units_per_em > 0.) {
+        return 0.;
+    }
+    // FT_Set_Char_Size: the size in 26.6; FT_DivFix: the 16.16 scale from font units to 26.6
+    let size_26_6 = round_half_up(font_size * 64.) as f64;
+    let scale_16_16 = round_half_up_f64(size_26_6 * 65536. / units_per_em as f64);
+    // FT_MulFix: the width in 26.6
+    let width_26_6 = round_half_up_f64(width as f64 * scale_16_16 / 65536.);
+    // FT_PIX_ROUND
+    (round_half_up_f64((width_26_6 + 32.) / 64. - 0.5)) as f32
+}
+
+fn round_half_up_f64(value: f64) -> f64 {
+    let shifted = value + 0.5;
+    let truncated = shifted as i64 as f64;
+    if truncated > shifted { truncated - 1. } else { truncated }
 }
 
 #[cfg(test)]
@@ -785,6 +864,7 @@ mod tests {
                 language: None,
                 features: &[],
                 variations: &[],
+                whole_pixel_advances: false,
             },
         }];
         shaper.shape_text(
@@ -967,6 +1047,7 @@ mod tests {
                     language: None,
                     features: &[],
                     variations: &[],
+                    whole_pixel_advances: false,
                 },
             },
             Item {
@@ -977,6 +1058,7 @@ mod tests {
                     language: None,
                     features: &[],
                     variations: &[],
+                    whole_pixel_advances: false,
                 },
             },
         ];

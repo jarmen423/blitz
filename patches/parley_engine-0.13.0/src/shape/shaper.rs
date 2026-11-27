@@ -40,6 +40,12 @@ pub struct ShapeOptions<'a> {
     pub features: &'a [FontFeature],
     /// The font variations that are constant over an item.
     pub variations: &'a [FontVariation],
+    /// known-future (wave 2): place glyphs as Blink does on Linux when it does not place them at
+    /// sub-pixel positions (its default there, unless the text has `text-rendering:
+    /// geometricPrecision`). The shaper is given each glyph's advance width as FreeType hints it,
+    /// a whole number of pixels, and what comes out of shaping (advances with their kerning, and
+    /// offsets) is rounded to whole pixels in turn (`RoundHarfBuzzBufferPositions`).
+    pub whole_pixel_advances: bool,
 }
 
 /// The font instance to shape an item with.

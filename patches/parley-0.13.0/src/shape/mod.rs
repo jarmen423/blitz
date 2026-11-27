@@ -173,6 +173,8 @@ pub(crate) fn shape_text<'a, B: Brush>(
                     point_size: item_style.font_size / scale,
                     features: &style_features[item_style_index as usize],
                     variations: rcx.variations(item_style.font_variations).unwrap_or(&[]),
+                    // (known-future, wave 2)
+                    whole_pixel_advances: crate::text_mode() == crate::TextMode::WholePixel,
                 },
             })
         })
@@ -404,13 +406,15 @@ impl<'a, 'b, B: Brush> parley_engine::FontSelector for FontSelector<'a, 'b, B> {
             };
 
             let coverage = cluster.calculate_coverage(|ch| {
-                charmap
-                    .map(ch)
-                    .map(|g| {
-                        // Any non-zero value indicates the existence of a glyph.
-                        g != 0
-                    })
-                    .unwrap_or_default()
+                // (known-future, wave 2) a face with a `unicode-range` draws the characters in it alone
+                font.stands_for(ch as u32)
+                    && charmap
+                        .map(ch)
+                        .map(|g| {
+                            // Any non-zero value indicates the existence of a glyph.
+                            g != 0
+                        })
+                        .unwrap_or_default()
             });
             if coverage > best_coverage {
                 selected_font = Some(font);

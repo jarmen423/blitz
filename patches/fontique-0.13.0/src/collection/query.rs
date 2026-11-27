@@ -183,13 +183,16 @@ impl<'a> Query<'a> {
     /// Returns the [first available font] for the current settings: the first
     /// font that [`matches_with`](Self::matches_with) would yield, if any.
     ///
-    /// CSS additionally requires the font's `unicode-range` to include U+0020
-    /// SPACE; fontique has no `unicode-range`, so every available font qualifies.
+    /// As CSS requires, a font whose `unicode-range` does not include U+0020
+    /// SPACE is passed over (known-future, wave 2).
     ///
     /// [first available font]: https://drafts.csswg.org/css-fonts-4/#first-available-font
     pub fn first_available_font(&mut self) -> Option<QueryFont> {
         let mut found = None;
         self.matches_with(|font| {
+            if !font.stands_for(0x20) {
+                return QueryStatus::Continue;
+            }
             found = Some(font.clone());
             QueryStatus::Stop
         });
@@ -259,9 +262,22 @@ pub struct QueryFont {
     pub synthesis: Synthesis,
     /// Data used for constructing a character map for this font.
     pub charmap_index: CharmapIndex,
+    /// known-future (wave 2): the `unicode-range` of the `@font-face` rule the font comes from (inclusive ranges
+    /// of code points), when it has one. See [`Self::stands_for`].
+    pub unicode_ranges: Option<alloc::sync::Arc<[(u32, u32)]>>,
 }
 
 impl QueryFont {
+    /// known-future (wave 2): whether the font may be used for the character at all: it has no `unicode-range`,
+    /// or the character is in it. A face is not used for a character outside its range even where it has a glyph
+    /// for it (CSS Fonts 4, 4.5).
+    pub fn stands_for(&self, ch: u32) -> bool {
+        match &self.unicode_ranges {
+            Some(ranges) => ranges.iter().any(|(start, end)| *start <= ch && ch <= *end),
+            None => true,
+        }
+    }
+
     /// Attempts to construct a [Charmap] for this font.
     pub fn charmap(&self) -> Option<Charmap<'_>> {
         self.charmap_index.charmap(self.blob.as_ref())
@@ -307,6 +323,7 @@ fn load_bucket<'a>(
                         fallback,
                     ),
                     charmap_index: font_info.charmap_index(),
+                    unicode_ranges: font_info.unicode_ranges().cloned(),
                 });
             }
             if fonts.is_empty() {
@@ -351,6 +368,7 @@ fn load_font<'a>(
                 index: blob_index,
                 synthesis,
                 charmap_index: font_info.charmap_index(),
+                unicode_ranges: font_info.unicode_ranges().cloned(),
             });
             if let Entry::Ok(font) = status {
                 Some(font)

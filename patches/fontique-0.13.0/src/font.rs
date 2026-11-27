@@ -27,6 +27,12 @@ pub struct FontInfo {
     weight_max: Option<FontWeight>,
     /// known-future (outside round 5): registered from a CSS `@font-face` rule (FontInfoOverride::css_face)
     css_face: bool,
+    /// known-future (wave 2): the `unicode-range` of the face's `@font-face` rule, as inclusive ranges of
+    /// code points; `None` for a face that stands for every character it has a glyph for
+    unicode_ranges: Option<alloc::sync::Arc<[(u32, u32)]>>,
+    /// known-future (wave 2): where the face's `@font-face` rule comes among the others (later rules have
+    /// larger numbers; 0 for a face that no rule declares)
+    css_order: u32,
     axes: AxisVec,
     attr_axes: u8,
     charmap_index: CharmapIndex,
@@ -94,6 +100,17 @@ impl FontInfo {
     /// known-future (outside round 5): the upper end of the face's `@font-face` weight range, when it has one
     pub fn weight_max(&self) -> Option<FontWeight> {
         self.weight_max
+    }
+
+    /// known-future (wave 2): the `unicode-range` of the face's `@font-face` rule (inclusive ranges of code
+    /// points), when it has one: the face is used for those characters alone
+    pub fn unicode_ranges(&self) -> Option<&alloc::sync::Arc<[(u32, u32)]>> {
+        self.unicode_ranges.as_ref()
+    }
+
+    /// known-future (wave 2): where the face's `@font-face` rule comes among the others (0: no rule)
+    pub fn css_order(&self) -> u32 {
+        self.css_order
     }
 
     /// Returns synthesis suggestions for this font with the given attributes.
@@ -303,6 +320,8 @@ impl FontInfo {
             weight,
             weight_max: None,
             css_face: false,
+            unicode_ranges: None,
+            css_order: 0,
             axes,
             attr_axes,
             charmap_index,
@@ -341,6 +360,12 @@ impl FontInfo {
             self.weight_max = (hi.value() > self.weight.value()).then_some(hi);
         }
         self.css_face |= info_override.css_face;
+        if let Some(ranges) = info_override.unicode_ranges {
+            self.unicode_ranges = Some(ranges.into());
+        }
+        if let Some(order) = info_override.css_order {
+            self.css_order = order;
+        }
         if let Some(axes) = info_override.axes {
             // This is O(n^2) but no font should have enough axes for that to
             // matter (read-fonts does the same thing)
@@ -546,6 +571,14 @@ pub struct FontInfoOverride<'a> {
     /// known-future (outside round 5): the font comes from a CSS `@font-face` rule, whose weight Chrome draws and
     /// fakes by the rule's descriptors (FontInfo::synthesis_with)
     pub css_face: bool,
+    /// known-future (wave 2): the `unicode-range` descriptor of the `@font-face` rule the font comes from, as
+    /// inclusive ranges of code points. The face is then one of the faces that together make the family's face of
+    /// that weight, style and width, and is used for the characters in its range alone (CSS Fonts 4, 4.5).
+    pub unicode_ranges: Option<&'a [(u32, u32)]>,
+    /// known-future (wave 2): where the `@font-face` rule comes among the others, later rules having larger
+    /// numbers. Of the faces that could draw a character, the one declared last is used (CSS Fonts 4, 5.2: "in
+    /// reverse order of @font-face rule definition").
+    pub css_order: Option<u32>,
     /// Default values for the font's variation axes. Axes not included within
     /// the font will be ignored.
     pub axes: Option<&'a [(Tag, f32)]>,

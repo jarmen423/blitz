@@ -153,6 +153,8 @@ mod tests;
 pub use linebender_resource_handle::FontData;
 pub use parlance::BaseDirection;
 pub use parley_engine::DictionaryProvider;
+/// known-future (wave 2): the advance width FreeType's hinting gives a glyph (see `TextMode::WholePixel`)
+pub use parley_engine::hinted_advance_width;
 pub use parley_engine::break_overrides::{
     AsciiLineBreakTable, AsciiLineBreakTableBuilder, CHROMIUM_LINE_BREAK_OVERRIDE,
     LineBreakContext, LineBreakOverrideFn,
@@ -176,9 +178,72 @@ pub use style::*;
 )]
 pub type Font = FontData;
 
+/// known-future (wave 2): which of Blink's rules on Linux a layout's text follows.
+///
+/// Blink places glyphs at sub-pixel positions only where it is asked for `text-rendering:
+/// geometricPrecision` (or the device scale is 1.5 or more). The two cases differ in the font's
+/// ascent and descent, in each glyph's advance, and in where glyphs are drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextMode {
+    /// The font's ascent and descent each rounded to a whole pixel, advances as the font and the
+    /// shaper give them, glyphs wherever the advances put them (parley's own rule, and fshot's
+    /// before 2026-11-18: `FSHOT_GEOMETRIC_PRECISION=0`).
+    Plain,
+    /// `text-rendering: geometricPrecision`: sub-pixel glyph positions, and one pixel moved from the
+    /// ascent to the descent when the descent rounds down (`FontMetrics::AscentDescentWithHacks`).
+    GeometricPrecision,
+    /// Blink's default: no sub-pixel positioning. Ascent and descent as in [`Self::Plain`]; each
+    /// glyph's own advance width is rounded to a whole pixel; the painter draws each glyph at a
+    /// whole pixel and hints it.
+    WholePixel,
+}
+
+std::thread_local! {
+    static SCOPED_TEXT_MODE: core::cell::Cell<Option<TextMode>> = const { core::cell::Cell::new(None) };
+}
+
+/// The text mode in force: the one of the innermost [`TextModeScope`] on this thread, else what
+/// the environment variable `FSHOT_GEOMETRIC_PRECISION` says (read once):
+/// [`TextMode::GeometricPrecision`] for `1`, and for `auto` too (with `auto` whoever lays out an
+/// element's text opens a scope for the mode its style asks for; text that is laid out with no
+/// scope, an editor's, stays as it was when `1` was the only choice), else [`TextMode::Plain`].
+pub fn text_mode() -> TextMode {
+    static FROM_ENV: std::sync::OnceLock<TextMode> = std::sync::OnceLock::new();
+    SCOPED_TEXT_MODE.with(|mode| mode.get()).unwrap_or_else(|| {
+        *FROM_ENV.get_or_init(|| match std::env::var("FSHOT_GEOMETRIC_PRECISION").as_deref() {
+            Ok("1") | Ok("auto") => TextMode::GeometricPrecision,
+            _ => TextMode::Plain,
+        })
+    })
+}
+
+/// known-future (wave 2): while one of these lives, the layouts built and broken into lines on
+/// this thread follow the given [`TextMode`] (`None`: the mode in force around it). Whoever lays
+/// out an element's text holds one for the mode its style asks for. Scopes nest: an inline-block
+/// laid out while its line is being broken has its own, and the line's is back when it is done.
+pub struct TextModeScope {
+    previous: Option<TextMode>,
+}
+
+impl TextModeScope {
+    /// Put `mode` in force until the scope is dropped.
+    pub fn enter(mode: Option<TextMode>) -> Self {
+        let previous = SCOPED_TEXT_MODE.with(|scoped| scoped.get());
+        if let Some(mode) = mode {
+            SCOPED_TEXT_MODE.with(|scoped| scoped.set(Some(mode)));
+        }
+        Self { previous }
+    }
+}
+
+impl Drop for TextModeScope {
+    fn drop(&mut self) {
+        SCOPED_TEXT_MODE.with(|scoped| scoped.set(self.previous));
+    }
+}
+
 /// Whether text is laid out as Chrome on Linux does under `text-rendering: geometricPrecision`
-/// (environment variable FSHOT_GEOMETRIC_PRECISION=1; a known-future patch, read once).
+/// (a known-future patch): [`text_mode`] is [`TextMode::GeometricPrecision`].
 pub fn geometric_precision() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| matches!(std::env::var("FSHOT_GEOMETRIC_PRECISION").as_deref(), Ok("1")))
+    text_mode() == TextMode::GeometricPrecision
 }
