@@ -211,7 +211,13 @@ impl ServoStylesheetLoader for StylesheetLoader {
         supports: Option<ImportSupportsCondition>,
         layer: ImportLayer,
     ) -> ServoArc<Locked<ImportRule>> {
-        if self.import_depth >= MAX_IMPORT_DEPTH || !supports.as_ref().is_none_or(|s| s.enabled) {
+        // known-future (wave 1a): an `@import` whose address is none (`@import url("")`, one that does not
+        // parse against the sheet's own) loads nothing, as in a browser (CSS Values 4, "url-empty"). It was
+        // unwrapped below, and stopped the process that was laying the page out.
+        if self.import_depth >= MAX_IMPORT_DEPTH
+            || !supports.as_ref().is_none_or(|s| s.enabled)
+            || url.url().is_none()
+        {
             return ServoArc::new(lock.wrap(ImportRule {
                 url,
                 stylesheet: ImportSheet::new_refused(),

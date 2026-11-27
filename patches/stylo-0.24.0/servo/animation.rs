@@ -1656,6 +1656,13 @@ pub struct DocumentAnimationSet {
     /// The `ElementAnimationSet`s that this set contains.
     #[ignore_malloc_size_of = "Arc is hard"]
     pub sets: Arc<RwLock<FxHashMap<AnimationSetKey, ElementAnimationSet>>>,
+    /// known-future (wave 1a): while set, no CSS transition is started in this document: a property whose
+    /// computed value changes has its new value at once, as if every `transition-duration` were zero. For a
+    /// layout engine that paints still pictures of a page at chosen states (fshot), where a transition would
+    /// only ever be seen at its first instant, which is the value before the change. CSS animations
+    /// (`@keyframes`) are not touched.
+    #[ignore_malloc_size_of = "a flag"]
+    pub transitions_off: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl DocumentAnimationSet {

@@ -403,6 +403,50 @@ bitflags! {
 }
 
 impl BaseDocument {
+    /// The font context a document makes for itself when its configuration gives it none: the system's fonts,
+    /// the bullet font, and (with BLITZ_CHROME_GENERICS=1) Chrome's generic families.
+    ///
+    /// known-future (wave 1a): made public so a process that lays out many documents reads the system's fonts
+    /// once and hands each document a clone ([`DocumentConfig::font_ctx`]): `fshot serve`. A clone holds its own
+    /// registered fonts, so one document's `@font-face` fonts are not another's.
+    pub fn default_font_context() -> FontContext {
+        use parley::fontique::{Collection, CollectionOptions, SourceCache};
+        let mut font_ctx = FontContext {
+            source_cache: SourceCache::new_shared(),
+            collection: Collection::new(CollectionOptions {
+                shared: false,
+                system_fonts: cfg!(all(feature = "system-fonts", not(target_arch = "wasm32"))),
+            }),
+        };
+        font_ctx
+            .collection
+            .register_fonts(Blob::new(Arc::new(crate::BULLET_FONT) as _), None);
+        chrome_linux_generics(&mut font_ctx.collection);
+        font_ctx
+    }
+
+    /// Set the style engine's preferences as the first document of a process sets them (which properties and
+    /// selectors Stylo parses depends on them).
+    ///
+    /// known-future (wave 1a): for a caller that asks the style engine about a property before it has made a
+    /// document (`fshot serve`'s `describe`).
+    pub fn init_style_prefs() {
+        init_stylo_prefs();
+    }
+
+    /// Whether a change of a computed value starts the CSS transition the element's style asks for (the
+    /// default), or the new value applies at once.
+    ///
+    /// known-future (wave 1a): a caller that lays a page out to paint still pictures of it at chosen states
+    /// turns transitions off before the first [`resolve`](Self::resolve): a transition it started would be
+    /// seen only at its first instant, which is the value before the change (so a picture painted after a
+    /// change of the page's CSS would show what the page was, not what it is). CSS animations are not touched.
+    pub fn set_css_transitions_enabled(&mut self, enabled: bool) {
+        self.animations
+            .transitions_off
+            .store(!enabled, Ordering::Relaxed);
+    }
+
     /// Create a new (empty) [`BaseDocument`] with the specified configuration
     pub fn new(config: DocumentConfig) -> Self {
         init_stylo_prefs();
@@ -418,24 +462,7 @@ impl BaseDocument {
                 // font_ctx.collection.make_shared();
                 font_ctx
             })
-            .unwrap_or_else(|| {
-                use parley::fontique::{Collection, CollectionOptions, SourceCache};
-                let mut font_ctx = FontContext {
-                    source_cache: SourceCache::new_shared(),
-                    collection: Collection::new(CollectionOptions {
-                        shared: false,
-                        system_fonts: cfg!(all(
-                            feature = "system-fonts",
-                            not(target_arch = "wasm32")
-                        )),
-                    }),
-                };
-                font_ctx
-                    .collection
-                    .register_fonts(Blob::new(Arc::new(crate::BULLET_FONT) as _), None);
-                chrome_linux_generics(&mut font_ctx.collection);
-                font_ctx
-            });
+            .unwrap_or_else(Self::default_font_context);
         let font_ctx = Arc::new(Mutex::new(font_ctx));
 
         let viewport = config.viewport.unwrap_or_default();

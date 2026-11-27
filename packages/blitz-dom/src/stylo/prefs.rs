@@ -18,6 +18,10 @@ pub(crate) fn init_stylo_prefs() {
         style_config::set_pref!("layout.css.font-variations.enabled", true);
         style_config::set_pref!("layout.css.text-indent-keywords.enabled", true);
         style_config::set_pref!("layout.css.word-break.break-word.enabled", true);
+        // known-future (wave 1a): `:has()`. With the preference off Stylo does not parse the selector, and a
+        // rule that holds one is dropped whole, as an invalid rule is: a page's `.card:has(.flag){filter:...}`
+        // styled nothing, and nothing said so.
+        style_config::set_pref!("layout.css.has-selector.enabled", true);
         #[cfg(feature = "writing-mode")]
         {
             style_config::set_pref!("layout.css.writing-mode.enabled", true);

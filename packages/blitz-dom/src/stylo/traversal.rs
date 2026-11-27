@@ -52,6 +52,23 @@ impl crate::document::BaseDocument {
             .flush(&guards)
             .process_style(root, Some(&self.snapshots));
 
+        // known-future (wave 1a): `:has()`. Stylo invalidates what a relative selector styles only when the
+        // embedder walks the surroundings of each changed element for it, which Blitz does not do: an element
+        // styled by `.card:has(.flag)` kept the style it had when a class, an id or an attribute elsewhere
+        // changed. So when an element was snapshotted since the last pass (one of those changed) and a style
+        // sheet holds a relative selector, every element is matched again. A page with no `:has()` pays
+        // nothing; one with it pays a whole restyle per change instead of having styles that depend on what
+        // the page was before.
+        if !self.snapshots.is_empty()
+            && self.stylist.iter_origins().any(|(data, _)| {
+                data.relative_invalidation_map_attributes().used
+                    || data.relative_selector_invalidation_map().len() > 0
+            })
+        {
+            let root_id = self.root_element().id;
+            self.nodes[root_id].set_restyle_hint(RestyleHint::restyle_subtree());
+        }
+
         // Mark actively animating nodes as dirty
         let mut sets = self.animations.sets.write();
         for (key, set) in sets.iter_mut() {

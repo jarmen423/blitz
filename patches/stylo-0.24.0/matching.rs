@@ -715,12 +715,20 @@ trait PrivateMatchMethods: TElement {
             pseudo_element,
         );
 
-        let might_need_transitions_update = self.might_need_transitions_update(
-            context,
-            old_values.as_deref(),
-            new_values,
-            pseudo_element,
-        );
+        // known-future (wave 1a): a document may start no transitions at all
+        // (`DocumentAnimationSet::transitions_off`)
+        let transitions_off = context
+            .shared
+            .animations
+            .transitions_off
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let might_need_transitions_update = !transitions_off
+            && self.might_need_transitions_update(
+                context,
+                old_values.as_deref(),
+                new_values,
+                pseudo_element,
+            );
 
         let mut after_change_style = None;
         if might_need_transitions_update {
