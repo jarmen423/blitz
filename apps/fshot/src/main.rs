@@ -1870,7 +1870,7 @@ mod tests {
     /// one of them at a time.
     static PAGE_TESTS: Mutex<()> = Mutex::new(());
 
-    fn page_tests() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn page_tests() -> std::sync::MutexGuard<'static, ()> {
         PAGE_TESTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 

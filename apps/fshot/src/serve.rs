@@ -1106,6 +1106,72 @@ mod tests {
         // (the same JSON)
         assert_eq!(serde_json::from_str::<Value>(&line).unwrap(), serde_json::from_str::<Value>(raw).unwrap());
     }
+
+    // ---- known-future, wave 2, fix round 2 ----
+
+    fn ask(server: &mut Server, req: Value) -> Value {
+        let (answer, _) = server.handle(&req.to_string(), &mut None);
+        let answer: Value = serde_json::from_str(&answer).unwrap();
+        assert_eq!(answer["ok"], Value::Bool(true), "{req}: {answer}");
+        answer
+    }
+
+    /// The requests `prepare` makes of the page of tests/test_w0_mem.py's B2 case, in every writing mode: `#box`
+    /// holds the `kf-text` wrappers of the four texts its script writes (the first empty), one shown at a time.
+    /// The wrapper shown last before a `reset` is hidden again in the inline root `#box` then is, and still listed
+    /// the block it held; when a later record shows another wrapper `#box` is a block container once more, and
+    /// the layout pass met that block, unstyled since its wrapper was hidden (it panicked: `layout_style() called
+    /// on a node without computed styles`). Every picture is the one of a page opened afresh in that state.
+    #[test]
+    fn paintset_after_reset_shows_each_wrapper_of_box_empty_as_a_page_opened_afresh() {
+        let _one_at_a_time = crate::tests::page_tests();
+        blitz_dom::BaseDocument::init_style_prefs();
+        let dir = std::env::temp_dir().join(format!("fshot-fix2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        const OPAQUE: &str = "[data-i=\"0\"],[data-i=\"2\"]{opacity:1 !important}\n";
+        let shown = |i: &str| -> String {
+            ["3", "4", "6", "8"]
+                .iter()
+                .map(|j| format!("[data-i=\"{j}\"]{{display:{} !important}}\n", if *j == i { "inline" } else { "none" }))
+                .collect()
+        };
+        let records = [("c0", "/**/".to_string()), ("c1_v0", shown("3")), ("c1_v1", shown("4")), ("c1_v2", shown("6")), ("c1_v3", shown("8"))];
+        for wm in ["horizontal-tb", "vertical-rl", "vertical-lr"] {
+            let page = format!(
+                "<!DOCTYPE html><html><head><style>html,body{{margin:0;width:480px;height:200px;overflow:hidden;background:#101418}}\
+                 kf-text{{display:none}}kf-text[data-kf-on]{{display:inline}}#box{{writing-mode:{wm};position:absolute;left:20px;\
+                 top:30px;padding:10px;background:#246;border:3px solid #fc0;color:#fff;font-size:22px}}#box:empty{{display:none}}\
+                 </style><meta name=\"fshot-viewport\" content=\"480x200\"><style id=\"fshot-pic\">/**/</style></head><body>\
+                 <div id=\"root\" data-i=\"0\" style=\"position:absolute;left:0;top:0;width:480px;height:200px;overflow:hidden\">\
+                 <div id=\"stage\" data-i=\"1\" style=\"position:relative;overflow:hidden;width:480px;height:200px\">\
+                 <div id=\"box\" data-i=\"2\"><kf-text data-kf-on=\"\" data-i=\"3\"></kf-text><kf-text data-i=\"4\">\
+                 <div class=\"line\" data-i=\"5\">Msg W</div></kf-text><kf-text data-i=\"6\"><div class=\"line\" data-i=\"7\">\
+                 Msg WWW</div></kf-text><kf-text data-i=\"8\"><div class=\"line\" data-i=\"9\">Msg WWWWW</div></kf-text></div>\
+                 </div></div></body></html>"
+            );
+            let mut server = Server { painter: Painter::new(Backend::Skia), sessions: HashMap::new(), fonts: Fonts::new(), digests: false };
+            let out = |name: &str, how: &str| dir.join(format!("{wm}_{name}_{how}.rgba")).to_string_lossy().into_owned();
+            let record = |name: &str, css: &str, how: &str| serde_json::json!({"out": out(name, how), "w": 320, "h": 240, "css": css});
+            ask(&mut server, serde_json::json!({"id": 1, "cmd": "open", "doc": "base", "html": page, "viewport": [480, 200]}));
+            ask(&mut server, serde_json::json!({"id": 2, "cmd": "resolve", "doc": "base", "states": [{"css": OPAQUE}], "keep": true}));
+            ask(&mut server, serde_json::json!({"id": 3, "cmd": "reset", "doc": "base"}));
+            let last = format!("{OPAQUE}{}", shown("8"));
+            ask(&mut server, serde_json::json!({"id": 4, "cmd": "resolve", "doc": "base", "states": [{"css": last}], "keep": true}));
+            ask(&mut server, serde_json::json!({"id": 5, "cmd": "reset", "doc": "base"}));
+            let all: Vec<Value> = records.iter().map(|(name, css)| record(name, css.as_str(), "after_reset")).collect();
+            ask(&mut server, serde_json::json!({"id": 6, "cmd": "paintset", "doc": "base", "records": all}));
+            for (n, &(name, ref css)) in records.iter().enumerate() {
+                let fresh = format!("fresh{n}");
+                ask(&mut server, serde_json::json!({"id": 7 + 2 * n, "cmd": "open", "doc": fresh, "html": page, "viewport": [480, 200]}));
+                ask(&mut server, serde_json::json!({"id": 8 + 2 * n, "cmd": "paintset", "doc": fresh, "records": [record(name, css.as_str(), "fresh")]}));
+                let (after_reset, fresh) = (std::fs::read(out(name, "after_reset")).unwrap(), std::fs::read(out(name, "fresh")).unwrap());
+                assert!(after_reset == fresh, "{wm} {name}: the picture is not the one of a page opened afresh");
+                // (and #box, its background #246, is in it: the wrapper shown first is empty, but an element)
+                assert!(after_reset.chunks(4).any(|px| px[..3] == [0x22, 0x44, 0x66]), "{wm} {name}: no #box");
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
 
 pub(crate) fn serve() {

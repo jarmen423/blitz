@@ -242,15 +242,11 @@ impl LayoutPassState<'_> {
         parent_pos: Point<f32>,
         rounded_parent_pos: Point<f32>,
     ) {
-        let node = &self.doc.nodes[dom_node_id(node_id)];
-        let overflow = node.layout_style().overflow();
-        let is_scroll_container =
-            overflow.x.is_scroll_container() || overflow.y.is_scroll_container();
         let unrounded = physical_layout(
             self.get_unrounded_layout(node_id),
             placer_wm,
             placer_size,
-            is_scroll_container,
+            is_scroll_container(&self.doc.nodes[dom_node_id(node_id)]),
         );
 
         let pos = Point {
@@ -484,6 +480,21 @@ mod tests {
     }
 }
 
+/// Whether `node` is a scroll container (`overflow` other than `visible` or `clip` in either axis).
+/// A node with no computed styles is not one: a text node, or an element under `display: none`
+/// (Stylo clears the style data of a `display: none` subtree). [`physicalise_and_round_layout`]
+/// replaces `taffy::round_layout`, which reads no style at all, and the CSSOM geometry is asked
+/// about any element, so neither may assume it only ever meets styled ones.
+///
+/// [`physicalise_and_round_layout`]: LayoutPassState::physicalise_and_round_layout
+fn is_scroll_container(node: &Node) -> bool {
+    if node.primary_styles().is_none() {
+        return false;
+    }
+    let overflow = node.layout_style().overflow();
+    overflow.x.is_scroll_container() || overflow.y.is_scroll_container()
+}
+
 /// `logical`, written by a placing algorithm running in `placer_wm` within a box of physical size
 /// `placer_size`, in physical coordinates.
 fn physical_layout(
@@ -559,12 +570,11 @@ impl BaseDocument {
         let root_id = self.try_root_element().map(|root| root.id);
         let node = &self.nodes[node_id];
         let (mut pos, placer_wm, placer_size) = self.placer_geometry(node, node_id, root_id);
-        let overflow = node.layout_style().overflow();
         let layout = physical_layout(
             *node.unrounded_layout(),
             placer_wm,
             placer_size,
-            overflow.x.is_scroll_container() || overflow.y.is_scroll_container(),
+            is_scroll_container(node),
         );
         pos.x += layout.location.x - node.scroll_offset().x as f32;
         pos.y += layout.location.y - node.scroll_offset().y as f32;
@@ -594,12 +604,11 @@ impl BaseDocument {
         let (mut pos, grand_wm, grand_size) = self.placer_geometry(placer, placer_id, root_id);
         let logical = placer.unrounded_layout();
         let (location, size) = if grand_wm.is_vertical() {
-            let overflow = placer.layout_style().overflow();
             let physical = physical_layout(
                 *logical,
                 grand_wm,
                 grand_size,
-                overflow.x.is_scroll_container() || overflow.y.is_scroll_container(),
+                is_scroll_container(placer),
             );
             (physical.location, physical.size)
         } else {

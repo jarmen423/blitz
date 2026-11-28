@@ -307,6 +307,22 @@ impl BaseDocument {
             let mut damage = doc.nodes[node_id].damage().unwrap_or(ALL_DAMAGE);
             let _flags = doc.nodes[node_id].flags;
 
+            // known-future (wave 2, fix round 2): a `display: none` box generates no boxes, so it
+            // has no layout children; but it can still list the children it had when it was last
+            // displayed. The construction damage of a `display: none` descendant of an inline root
+            // is consumed without the box being reconstructed (`find_inline_layout_embedded_boxes`),
+            // and when that inline root turns into a block container again (a sibling became
+            // block-level) the box is one of its layout children once more, with no damage of its
+            // own. Its old children lost their styles with it (Stylo clears the style data of a
+            // `display: none` subtree), so neither construction (which would build an inline
+            // layout for an unstyled element) nor layout may visit them again: the box is
+            // reconstructed, to no children.
+            if !damage.intersects(CONSTRUCT_FC | CONSTRUCT_BOX)
+                && lists_children_while_undisplayed(&doc.nodes[node_id])
+            {
+                damage.insert(CONSTRUCT_BOX);
+            }
+
             if damage.intersects(CONSTRUCT_FC | CONSTRUCT_BOX) {
                 //} || flags.contains(NodeFlags::IS_INLINE_ROOT) {
 
@@ -364,6 +380,17 @@ impl BaseDocument {
             }
 
             doc.nodes[node_id].set_damage(damage);
+        }
+
+        /// A `display: none` box with layout children or anonymous blocks of its own (see above)
+        fn lists_children_while_undisplayed(node: &crate::node::Node) -> bool {
+            node.display_style().is_some_and(|display| display.is_none())
+                && (node
+                    .layout_children
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|children| !children.is_empty())
+                    || !node.anonymous_blocks.is_empty())
         }
     }
 
@@ -507,5 +534,162 @@ impl BaseDocument {
 
         // println!("\n\n");
         // taffy::print_tree(self, root_node_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Attribute, BaseDocument, DocumentConfig, qual_name};
+    use blitz_traits::node_id::NodeId;
+    use blitz_traits::shell::{ColorScheme, Viewport};
+
+    /// known-future (wave 2, fix round 2): a `<div>` holding three inline wrappers, as `fshot` wraps the
+    /// texts a film's script writes: the first empty, the other two around a block. Each is shown
+    /// (`display: inline`) or not (`display: none`); the page is in `writing_mode`.
+    struct Wrappers {
+        doc: BaseDocument,
+        container: NodeId,
+        wrappers: [NodeId; 3],
+        lines: [NodeId; 2],
+    }
+
+    impl Wrappers {
+        fn new(writing_mode: &str, shown: [bool; 3]) -> Self {
+            let mut doc = BaseDocument::new(DocumentConfig {
+                viewport: Some(Viewport::new(480, 200, 1.0, ColorScheme::Light)),
+                ..Default::default()
+            });
+            let root_id = doc.root_node().id;
+            let style = |value: String| Attribute {
+                name: qual_name!("style"),
+                value,
+            };
+            let mut mutator = doc.mutate();
+            let html = mutator.create_element(
+                qual_name!("html"),
+                vec![style(format!("writing-mode:{writing_mode}"))],
+            );
+            // (a document of this crate has no user agent style sheet: every element is inline but where said)
+            let body =
+                mutator.create_element(qual_name!("body"), vec![style("display:block;margin:0".into())]);
+            let container = mutator.create_element(
+                qual_name!("div"),
+                vec![style(
+                    "position:absolute;left:20px;top:30px;padding:10px;border:3px solid;font-size:22px"
+                        .into(),
+                )],
+            );
+            let mut wrappers = Vec::new();
+            let mut lines = Vec::new();
+            for text in ["", "Msg W", "Msg WWW"] {
+                let wrapper = mutator.create_element(qual_name!("span"), vec![]);
+                if !text.is_empty() {
+                    let line =
+                        mutator.create_element(qual_name!("div"), vec![style("display:block".into())]);
+                    let text = mutator.create_text_node(text);
+                    mutator.append_children(line, &[text]);
+                    mutator.append_children(wrapper, &[line]);
+                    lines.push(line);
+                }
+                wrappers.push(wrapper);
+            }
+            mutator.append_children(container, &wrappers);
+            mutator.append_children(body, &[container]);
+            mutator.append_children(html, &[body]);
+            mutator.append_children(root_id, &[html]);
+            drop(mutator);
+            let mut page = Self {
+                doc,
+                container,
+                wrappers: wrappers.try_into().unwrap(),
+                lines: lines.try_into().unwrap(),
+            };
+            page.show(shown);
+            page
+        }
+
+        fn show(&mut self, shown: [bool; 3]) {
+            let mut mutator = self.doc.mutate();
+            for (wrapper, shown) in self.wrappers.into_iter().zip(shown) {
+                let display = if shown {
+                    "display:inline"
+                } else {
+                    "display:none"
+                };
+                mutator.set_attribute(wrapper, qual_name!("style"), display);
+            }
+            drop(mutator);
+            self.doc.resolve(0.0);
+        }
+
+        fn layout_children(&self, id: NodeId) -> Vec<NodeId> {
+            self.doc.nodes[id]
+                .layout_children
+                .borrow()
+                .as_ref()
+                .map_or_else(Vec::new, |children| children.to_vec())
+        }
+
+        /// The boxes the layout pass visits (layout children and hoisted out-of-flow boxes, from
+        /// the root) that have no computed styles
+        fn unstyled_boxes(&self) -> Vec<String> {
+            let mut unstyled = Vec::new();
+            let mut stack = vec![self.doc.root_node().id];
+            while let Some(id) = stack.pop() {
+                let node = &self.doc.nodes[id];
+                if node.primary_styles().is_none() {
+                    unstyled.push(node.node_debug_str());
+                }
+                stack.extend(self.layout_children(id));
+                stack.extend(node.hoisted_children.borrow().iter().copied());
+            }
+            unstyled
+        }
+
+        fn size(&self, id: NodeId) -> (f32, f32) {
+            let size = self.doc.nodes[id].final_layout().size;
+            (size.width, size.height)
+        }
+    }
+
+    /// A `display: none` wrapper that was shown when its container last was a block container,
+    /// and was hidden while the container was an inline root, lists no layout children when the
+    /// container is a block container again: the block it held lost its styles when it was
+    /// hidden. (These are the states `fshot serve` puts the page of `tests/test_w0_mem.py`'s B2
+    /// case in; with `writing-mode`, the layout pass panicked on that unstyled block.)
+    #[test]
+    fn a_wrapper_hidden_in_an_inline_root_lists_no_layout_children_once_its_container_is_a_block() {
+        for writing_mode in ["horizontal-tb", "vertical-rl", "vertical-lr"] {
+            // the third shown: the container is a block container, the wrapper's block a box of it
+            let mut page = Wrappers::new(writing_mode, [false, false, true]);
+            let third = page.wrappers[2];
+            assert_eq!(page.layout_children(third), [page.lines[1]], "{writing_mode}");
+            // the empty one alone: the container is an inline root, the third wrapper not one of its boxes
+            page.show([true, false, false]);
+            assert!(page.layout_children(page.container).is_empty(), "{writing_mode}");
+            assert!(page.doc.nodes[page.lines[1]].primary_styles().is_none(), "{writing_mode}");
+            // nor is the CSSOM geometry of that block, an element with no styles, asked for its style
+            let _ = page.doc.get_client_bounding_rect(page.lines[1]);
+            // the second: a block container again, the hidden third wrapper one of its boxes once more
+            page.show([false, true, false]);
+            assert_eq!(
+                page.layout_children(page.container),
+                page.wrappers,
+                "{writing_mode}"
+            );
+            assert!(page.layout_children(third).is_empty(), "{writing_mode}");
+            assert_eq!(page.unstyled_boxes(), Vec::<String>::new(), "{writing_mode}");
+            // laid out as the page built in that state is
+            let fresh = Wrappers::new(writing_mode, [false, true, false]);
+            assert_eq!(page.size(page.container), fresh.size(fresh.container), "{writing_mode}");
+            assert_eq!(page.size(page.lines[0]), fresh.size(fresh.lines[0]), "{writing_mode}");
+            // the third shown again: its block is styled and laid out again
+            page.show([false, false, true]);
+            assert_eq!(page.layout_children(third), [page.lines[1]], "{writing_mode}");
+            assert_eq!(page.unstyled_boxes(), Vec::<String>::new(), "{writing_mode}");
+            let fresh = Wrappers::new(writing_mode, [false, false, true]);
+            assert_eq!(page.size(page.container), fresh.size(fresh.container), "{writing_mode}");
+            assert_eq!(page.size(page.lines[1]), fresh.size(fresh.lines[1]), "{writing_mode}");
+        }
     }
 }
